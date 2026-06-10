@@ -242,6 +242,8 @@ def main():
         args.run_dir_file.parent.mkdir(parents=True, exist_ok=True)
         args.run_dir_file.write_text(f"{run_dir}\n", encoding="utf-8")
 
+    checkpoint_dir = run_dir / "checkpoints"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
     log_path = run_dir / "train_log.csv"
     model.train()
     train_start = time.perf_counter()
@@ -286,8 +288,8 @@ def main():
         )
 
         if iteration % checkpoint_interval == 0:
-            numbered_path = run_dir / f"checkpoint_{iteration:06d}.pt"
-            latest_path = run_dir / "latest.pt"
+            numbered_path = checkpoint_dir / f"checkpoint_{iteration:06d}.pt"
+            latest_path = checkpoint_dir / "latest.pt"
             save_checkpoint(
                 numbered_path,
                 model,
