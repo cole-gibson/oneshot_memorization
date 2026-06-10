@@ -245,6 +245,8 @@ def main():
     log_path = run_dir / "train_log.csv"
     model.train()
     train_start = time.perf_counter()
+    last_checkpoint_time = train_start
+    last_checkpoint_iter = start_iter
 
     max_iters = int(config["training"]["max_iters"])
     checkpoint_interval = int(config["training"]["checkpoint_interval"])
@@ -306,8 +308,15 @@ def main():
                 data_generator,
                 distribution_use_counts,
             )
-
-        print(f"iter {iteration} loss {loss.item():.6f}")
+            now = time.perf_counter()
+            checkpoint_iters = iteration - last_checkpoint_iter
+            seconds_per_iter = (now - last_checkpoint_time) / checkpoint_iters
+            last_checkpoint_time = now
+            last_checkpoint_iter = iteration
+            print(
+                f"iter {iteration} loss {loss.item():.6f} "
+                f"time_per_iter {seconds_per_iter:.4f}s"
+            )
 
     print(f"run directory: {run_dir}")
 
