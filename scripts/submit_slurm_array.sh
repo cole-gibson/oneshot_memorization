@@ -121,6 +121,9 @@ fi
 
 sbatch \
   "$@" \
+  --time=00:01:00 \
+  --constraint=gpu80 \
+  --gres=gpu:1 \
   --job-name="$job_name" \
   --array="$array_spec" \
   --output="$pending_log_dir/%x-%A_%a.out" \
