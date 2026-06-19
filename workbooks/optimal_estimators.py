@@ -1,6 +1,6 @@
 import marimo
 
-__generated_with = "0.23.6"
+__generated_with = "0.23.9"
 app = marimo.App(width="medium")
 
 
@@ -8,6 +8,9 @@ app = marimo.App(width="medium")
 def _():
     import marimo as mo
     import torch
+
+    import sys
+    sys.path.append("..")
 
     from base.data_generator import DirichletZipfSequenceGenerator
 
@@ -268,16 +271,21 @@ def _(
     DirichletZipfSequenceGenerator,
     mo,
 ):
+    alpha = 0.1
+    num_states = 100
+    sequence_length = 100
+    num_distributions = 100_000
+
     generator = DirichletZipfSequenceGenerator(
-        num_distributions=10_000,
-        num_states=100,
-        alpha=0.1,
+        num_distributions=num_distributions,
+        num_states=num_states,
+        alpha=alpha,
         zipf_exponent=1.0,
     )
-    tokens = generator.sample(batch_size=256, sequence_length=129)
+    tokens = generator.sample(batch_size=2**12, sequence_length=sequence_length)
 
     bayes = BayesOptimalEstimator.from_generator(generator)
-    empirical = DirichletEmpiricalEstimator(num_states=100, alpha=1.0)
+    empirical = DirichletEmpiricalEstimator(num_states=num_states, alpha=alpha)
 
     bayes_probs = bayes.predict_proba(tokens[:, :-1])
     empirical_probs = empirical.predict_proba(tokens[:, :-1])
