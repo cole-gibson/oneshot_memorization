@@ -83,6 +83,45 @@ class DirichletZipfSequenceGenerator:
             return flat_samples, distribution_ids
         return flat_samples
 
+    @torch.no_grad()
+    def sample_from_distribution_ids(self, distribution_ids, sequence_length):
+        """Sample sequences from explicitly supplied component ids.
+
+        ``distribution_ids`` is a one-dimensional tensor-like object with one
+        component id per requested sequence. The returned LongTensor has shape
+        ``(len(distribution_ids), sequence_length)``.
+        """
+        if sequence_length < 1:
+            raise ValueError("sequence_length must be at least 1")
+
+        distribution_ids = torch.as_tensor(distribution_ids, device=self.device)
+        if distribution_ids.ndim != 1:
+            raise ValueError("distribution_ids must have shape (batch_size,)")
+        if distribution_ids.numel() == 0:
+            raise ValueError("distribution_ids must contain at least one id")
+        if not torch.is_floating_point(distribution_ids):
+            distribution_ids = distribution_ids.to(dtype=torch.long)
+        else:
+            if not torch.all(distribution_ids == distribution_ids.long()):
+                raise ValueError("distribution_ids must contain integer ids")
+            distribution_ids = distribution_ids.to(dtype=torch.long)
+        if (
+            distribution_ids.min() < 0
+            or distribution_ids.max() >= self.num_distributions
+        ):
+            raise ValueError(
+                "distribution_ids contain ids outside "
+                f"[0, {self.num_distributions})"
+            )
+
+        selected_distributions = self.distributions[distribution_ids]
+        return torch.multinomial(
+            selected_distributions,
+            num_samples=sequence_length,
+            replacement=True,
+            generator=self.generator,
+        )
+
     __call__ = sample
 
     def to(self, device):
