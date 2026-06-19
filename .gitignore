@@ -12,3 +12,11 @@ wheels/
 # Slurm submissions
 .slurm_manifests/
 logs/slurm/
+
+# Utilities and Scripts
+scripts/
+
+# Marimo-generated Directories
+__marimo__/
+
+configs/
