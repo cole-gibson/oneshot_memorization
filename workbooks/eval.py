@@ -1,0 +1,579 @@
+import marimo
+
+__generated_with = "0.23.9"
+app = marimo.App(width="medium")
+
+
+@app.cell
+def _():
+    import csv
+    import os
+    import re
+    import sys
+    from pathlib import Path
+
+    MPLCONFIGDIR = Path(f"/tmp/oneshot_memorization_matplotlib_{os.getuid()}")
+    MPLCONFIGDIR.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault("MPLCONFIGDIR", str(MPLCONFIGDIR))
+
+    import matplotlib.pyplot as plt
+    import torch
+    import torch.nn.functional as F
+    import yaml
+
+    repo_root = Path(__file__).resolve().parents[1]
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+
+    from base.data_generator import DirichletZipfSequenceGenerator
+    from base.model import Transformer
+    from workbooks.optimal_estimators import (
+        BayesOptimalEstimator,
+        DirichletEmpiricalEstimator,
+    )
+
+    CHECKPOINT_RE = re.compile(r"checkpoint_(\d+)\.pt$")
+    return (
+        BayesOptimalEstimator,
+        CHECKPOINT_RE,
+        DirichletEmpiricalEstimator,
+        DirichletZipfSequenceGenerator,
+        F,
+        Path,
+        Transformer,
+        csv,
+        torch,
+        yaml,
+    )
+
+
+@app.cell
+def _(CHECKPOINT_RE, Path, torch, yaml):
+    def load_config(path):
+        with path.open("r", encoding="utf-8") as config_file:
+            config = yaml.safe_load(config_file)
+        if not isinstance(config, dict):
+            raise ValueError(f"{path} must contain a YAML mapping")
+        return config
+
+    def resolve_device(device_name):
+        if device_name == "auto":
+            if torch.cuda.is_available():
+                return torch.device("cuda")
+            return torch.device("cpu")
+        return torch.device(device_name)
+
+    def make_torch_generator(device, seed):
+        if device.type not in ("cpu", "cuda"):
+            return None
+        generator = torch.Generator(device=device)
+        generator.manual_seed(int(seed))
+        return generator
+
+    def parse_checkpoint_iteration(path):
+        match = CHECKPOINT_RE.match(path.name)
+        if match is None:
+            return None
+        return int(match.group(1))
+
+    def list_checkpoint_paths(checkpoint_dir, file_stride):
+        file_stride = int(file_stride)
+        if file_stride < 1:
+            raise ValueError("checkpoint stride must be at least 1")
+
+        checkpoint_dir = Path(checkpoint_dir)
+        checkpoints = [
+            path
+            for path in checkpoint_dir.glob("checkpoint_*.pt")
+            if parse_checkpoint_iteration(path) is not None
+        ]
+        checkpoints.sort(key=parse_checkpoint_iteration)
+        selected = checkpoints[::file_stride]
+        if checkpoints and checkpoints[-1] not in selected:
+            selected.append(checkpoints[-1])
+        return selected
+
+    def seed_torch(seed):
+        seed = int(seed)
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+
+    return (
+        list_checkpoint_paths,
+        load_config,
+        make_torch_generator,
+        parse_checkpoint_iteration,
+        resolve_device,
+        seed_torch,
+    )
+
+
+@app.cell
+def _(DirichletZipfSequenceGenerator, make_torch_generator, seed_torch, torch):
+    def build_generator(config, device, eval_seed):
+        data_config = config["data"]
+        seed_torch(int(config["seed"]))
+        return DirichletZipfSequenceGenerator(
+            num_distributions=data_config["num_distributions"],
+            num_states=data_config["num_states"],
+            alpha=data_config["alpha"],
+            zipf_exponent=data_config["zipf_exponent"],
+            device=device,
+            generator=make_torch_generator(device, eval_seed),
+        )
+
+    def make_balanced_batch(
+        generator,
+        batch_sequence_length,
+        batch_seqs_per_distribution,
+        batch_distribution_start,
+        batch_max_distributions,
+    ):
+        seqs_per_distribution_int = int(batch_seqs_per_distribution)
+        distribution_start_int = int(batch_distribution_start)
+        max_distributions_int = int(batch_max_distributions)
+        if seqs_per_distribution_int < 1:
+            raise ValueError("seqs_per_distribution must be at least 1")
+        if (
+            distribution_start_int < 0
+            or distribution_start_int >= generator.num_distributions
+        ):
+            raise ValueError("distribution_start must be in the distribution range")
+
+        distribution_stop = (
+            generator.num_distributions
+            if max_distributions_int == 0
+            else min(
+                generator.num_distributions,
+                distribution_start_int + max_distributions_int,
+            )
+        )
+        if distribution_stop <= distribution_start_int:
+            raise ValueError("selected distribution range is empty")
+
+        selected_distribution_ids = torch.arange(
+            distribution_start_int,
+            distribution_stop,
+            device=generator.device,
+            dtype=torch.long,
+        )
+        distribution_ids = selected_distribution_ids.repeat_interleave(
+            seqs_per_distribution_int
+        )
+        tokens = generator.sample_from_distribution_ids(
+            distribution_ids,
+            sequence_length=batch_sequence_length,
+        )
+        return tokens.cpu(), distribution_ids.cpu(), selected_distribution_ids.cpu()
+
+    return build_generator, make_balanced_batch
+
+
+@app.cell
+def _(F, torch):
+    def dirichlet_autoregressive_losses(tokens, estimator, eps=1e-30):
+        tokens = tokens.to(estimator.device)
+        input_ids = tokens[:, :-1]
+        targets = tokens[:, 1:]
+        batch_size, input_len = input_ids.shape
+        counts = torch.zeros(
+            batch_size,
+            estimator.num_states,
+            device=estimator.device,
+            dtype=estimator.dtype,
+        )
+        alpha = estimator.alpha.unsqueeze(0)
+        alpha_sum = estimator.alpha.sum()
+        losses = []
+
+        for pos in range(input_len):
+            counts.scatter_add_(
+                dim=1,
+                index=input_ids[:, pos : pos + 1],
+                src=torch.ones(
+                    batch_size,
+                    1,
+                    device=estimator.device,
+                    dtype=estimator.dtype,
+                ),
+            )
+            target_counts = (counts + alpha).gather(1, targets[:, pos : pos + 1])
+            denominator = alpha_sum + float(pos + 1)
+            losses.append(
+                -target_counts.div(denominator).clamp_min(eps).log().squeeze(1)
+            )
+
+        return torch.stack(losses, dim=1).mean(dim=1)
+
+    @torch.no_grad()
+    def model_autoregressive_losses(model, tokens):
+        input_ids = tokens[:, :-1]
+        targets = tokens[:, 1:]
+        logits = model(input_ids)["logits"]
+        losses = F.cross_entropy(
+            logits.transpose(1, 2),
+            targets,
+            reduction="none",
+        )
+        return losses.mean(dim=1)
+
+    @torch.no_grad()
+    def bayes_autoregressive_losses(tokens, estimator, component_chunk_size):
+        tokens = tokens.to(estimator.distributions.device)
+        input_ids = tokens[:, :-1]
+        targets = tokens[:, 1:]
+        batch_size, input_len = input_ids.shape
+        component_chunk_size = int(component_chunk_size)
+        if component_chunk_size < 1:
+            raise ValueError("component_chunk_size must be at least 1")
+
+        counts = torch.zeros(
+            batch_size,
+            estimator.num_states,
+            device=estimator.distributions.device,
+            dtype=estimator.distributions.dtype,
+        )
+        losses = []
+
+        for pos in range(input_len):
+            counts.scatter_add_(
+                dim=1,
+                index=input_ids[:, pos : pos + 1],
+                src=torch.ones(
+                    batch_size,
+                    1,
+                    device=estimator.distributions.device,
+                    dtype=estimator.distributions.dtype,
+                ),
+            )
+            target = targets[:, pos]
+            log_denominator = torch.full(
+                (batch_size,),
+                float("-inf"),
+                device=estimator.distributions.device,
+                dtype=estimator.distributions.dtype,
+            )
+            log_numerator = torch.full_like(log_denominator, float("-inf"))
+
+            for chunk_start in range(
+                0,
+                estimator.num_distributions,
+                component_chunk_size,
+            ):
+                chunk_stop = min(
+                    estimator.num_distributions,
+                    chunk_start + component_chunk_size,
+                )
+                log_distributions = estimator.log_distributions[
+                    chunk_start:chunk_stop
+                ]
+                component_scores = (
+                    counts @ log_distributions.T
+                    + estimator.log_prior[chunk_start:chunk_stop]
+                )
+                target_log_probs = log_distributions.T[target]
+                log_denominator = torch.logaddexp(
+                    log_denominator,
+                    torch.logsumexp(component_scores, dim=1),
+                )
+                log_numerator = torch.logaddexp(
+                    log_numerator,
+                    torch.logsumexp(component_scores + target_log_probs, dim=1),
+                )
+
+            losses.append(-(log_numerator - log_denominator))
+
+        return torch.stack(losses, dim=1).mean(dim=1)
+
+    return (
+        bayes_autoregressive_losses,
+        dirichlet_autoregressive_losses,
+        model_autoregressive_losses,
+    )
+
+
+@app.cell
+def _(
+    DirichletEmpiricalEstimator,
+    Transformer,
+    bayes_autoregressive_losses,
+    dirichlet_autoregressive_losses,
+    model_autoregressive_losses,
+    parse_checkpoint_iteration,
+    torch,
+):
+    def evaluate_checkpoint(
+        checkpoint_path,
+        config,
+        tokens,
+        distribution_ids,
+        selected_distribution_ids,
+        bayes_estimator,
+        bayes_component_chunk_size,
+        microbatch_size,
+        device,
+    ):
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        model = Transformer(**config["model"]).to(device)
+        model.load_state_dict(checkpoint["model_state"])
+        model.eval()
+
+        use_counts = checkpoint.get("distribution_use_counts")
+        if use_counts is None:
+            raise ValueError(
+                f"{checkpoint_path} does not contain distribution_use_counts"
+            )
+        use_counts = use_counts.cpu().to(dtype=torch.long)
+        if use_counts.numel() != config["data"]["num_distributions"]:
+            raise ValueError(
+                "checkpoint distribution_use_counts length does not match "
+                "data.num_distributions"
+            )
+
+        num_distributions = config["data"]["num_distributions"]
+        sum_model = torch.zeros(num_distributions, dtype=torch.float64)
+        sum_dirichlet = torch.zeros(num_distributions, dtype=torch.float64)
+        sum_dirichlet_gap = torch.zeros(num_distributions, dtype=torch.float64)
+        sum_bayes = torch.zeros(num_distributions, dtype=torch.float64)
+        sum_bayes_gap = torch.zeros(num_distributions, dtype=torch.float64)
+        eval_counts = torch.zeros(num_distributions, dtype=torch.long)
+
+        dirichlet_estimator = DirichletEmpiricalEstimator(
+            num_states=config["data"]["num_states"],
+            alpha=config["data"]["alpha"],
+            device=device,
+        )
+
+        microbatch_size = int(microbatch_size)
+        if microbatch_size < 1:
+            raise ValueError("microbatch_size must be at least 1")
+
+        for start in range(0, tokens.shape[0], microbatch_size):
+            stop = min(tokens.shape[0], start + microbatch_size)
+            batch_tokens = tokens[start:stop].to(device)
+            batch_distribution_ids = distribution_ids[start:stop]
+
+            model_losses = model_autoregressive_losses(model, batch_tokens).cpu()
+            dirichlet_losses = dirichlet_autoregressive_losses(
+                batch_tokens,
+                dirichlet_estimator,
+            ).cpu()
+            bayes_losses = bayes_autoregressive_losses(
+                batch_tokens,
+                bayes_estimator,
+                bayes_component_chunk_size,
+            ).cpu()
+            dirichlet_gaps = model_losses - dirichlet_losses
+            bayes_gaps = model_losses - bayes_losses
+
+            sum_model.scatter_add_(
+                0,
+                batch_distribution_ids,
+                model_losses.to(dtype=torch.float64),
+            )
+            sum_dirichlet.scatter_add_(
+                0,
+                batch_distribution_ids,
+                dirichlet_losses.to(dtype=torch.float64),
+            )
+            sum_dirichlet_gap.scatter_add_(
+                0,
+                batch_distribution_ids,
+                dirichlet_gaps.to(dtype=torch.float64),
+            )
+            sum_bayes.scatter_add_(
+                0,
+                batch_distribution_ids,
+                bayes_losses.to(dtype=torch.float64),
+            )
+            sum_bayes_gap.scatter_add_(
+                0,
+                batch_distribution_ids,
+                bayes_gaps.to(dtype=torch.float64),
+            )
+            eval_counts.scatter_add_(
+                0,
+                batch_distribution_ids,
+                torch.ones_like(batch_distribution_ids, dtype=torch.long),
+            )
+
+        fallback_iteration = parse_checkpoint_iteration(checkpoint_path)
+        iteration = int(checkpoint.get("iteration", fallback_iteration))
+        rows = []
+        for distribution_id in selected_distribution_ids.tolist():
+            count = int(eval_counts[distribution_id].item())
+            if count == 0:
+                continue
+            mean_dirichlet_loss = sum_dirichlet[distribution_id].item() / count
+            mean_dirichlet_gap = (
+                sum_dirichlet_gap[distribution_id].item() / count
+            )
+            rows.append(
+                {
+                    "checkpoint_path": str(checkpoint_path),
+                    "iteration": iteration,
+                    "distribution_id": distribution_id,
+                    "seqs_per_distribution": count,
+                    "mean_model_loss": sum_model[distribution_id].item() / count,
+                    "mean_dirichlet_loss": mean_dirichlet_loss,
+                    "mean_dirichlet_gap": mean_dirichlet_gap,
+                    "mean_baseline_loss": mean_dirichlet_loss,
+                    "mean_gap": mean_dirichlet_gap,
+                    "mean_bayes_loss": sum_bayes[distribution_id].item() / count,
+                    "mean_bayes_gap": sum_bayes_gap[distribution_id].item() / count,
+                    "training_seen_count": int(use_counts[distribution_id].item()),
+                }
+            )
+        return rows
+
+    return (evaluate_checkpoint,)
+
+
+@app.cell
+def _(
+    BayesOptimalEstimator,
+    Path,
+    build_generator,
+    csv,
+    evaluate_checkpoint,
+    list_checkpoint_paths,
+    load_config,
+    make_balanced_batch,
+    resolve_device,
+):
+    def write_rows_csv(rows, output_path):
+        output_path = Path(output_path)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        fieldnames = [
+            "checkpoint_path",
+            "iteration",
+            "distribution_id",
+            "seqs_per_distribution",
+            "mean_model_loss",
+            "mean_dirichlet_loss",
+            "mean_dirichlet_gap",
+            "mean_baseline_loss",
+            "mean_gap",
+            "mean_bayes_loss",
+            "mean_bayes_gap",
+            "training_seen_count",
+        ]
+        with output_path.open("w", newline="", encoding="utf-8") as output_file:
+            writer = csv.DictWriter(output_file, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+        return output_path
+
+    def run_evaluation(
+        eval_settings,
+    ):
+        experiment_dir_path = Path(eval_settings["experiment_dir"]).expanduser()
+        config_path = experiment_dir_path / "config.yaml"
+        checkpoint_dir = experiment_dir_path / "checkpoints"
+        if not config_path.exists():
+            raise FileNotFoundError(f"missing config.yaml: {config_path}")
+        if not checkpoint_dir.is_dir():
+            raise FileNotFoundError(f"missing checkpoints directory: {checkpoint_dir}")
+
+        config = load_config(config_path)
+        device = resolve_device(eval_settings["device_name"])
+        checkpoints = list_checkpoint_paths(
+            checkpoint_dir,
+            eval_settings["checkpoint_stride"],
+        )
+        if not checkpoints:
+            raise ValueError(f"no numbered checkpoints found in {checkpoint_dir}")
+
+        sequence_length = int(config["data"]["sequence_length"])
+        if sequence_length - 1 > int(config["model"]["max_seq_len"]):
+            raise ValueError("data.sequence_length - 1 exceeds model.max_seq_len")
+
+        generator = build_generator(config, device, eval_settings["eval_seed"])
+        bayes_estimator = BayesOptimalEstimator(
+            distributions=generator.distributions,
+            distribution_weights=generator.distributions.new_ones(
+                generator.num_distributions
+            ),
+        ).to(device)
+        tokens, distribution_ids, selected_distribution_ids = make_balanced_batch(
+            generator=generator,
+            batch_sequence_length=sequence_length,
+            batch_seqs_per_distribution=eval_settings["seqs_per_distribution"],
+            batch_distribution_start=eval_settings["distribution_start"],
+            batch_max_distributions=eval_settings["max_distributions"],
+        )
+
+        rows = []
+        for checkpoint_path in checkpoints:
+            rows.extend(
+                evaluate_checkpoint(
+                    checkpoint_path=checkpoint_path,
+                    config=config,
+                    tokens=tokens,
+                    distribution_ids=distribution_ids,
+                    selected_distribution_ids=selected_distribution_ids,
+                    bayes_estimator=bayes_estimator,
+                    bayes_component_chunk_size=eval_settings[
+                        "bayes_component_chunk_size"
+                    ],
+                    microbatch_size=eval_settings["microbatch_size"],
+                    device=device,
+                )
+            )
+
+        output_path = Path(eval_settings["output_csv"]).expanduser()
+        if not output_path.is_absolute():
+            output_path = experiment_dir_path / output_path
+        write_rows_csv(rows, output_path)
+
+        return {
+            "rows": rows,
+            "csv_path": output_path,
+            "num_checkpoints": len(checkpoints),
+            "num_distributions": len(selected_distribution_ids),
+            "num_sequences": tokens.shape[0],
+            "device": str(device),
+        }
+
+    return (run_evaluation,)
+
+
+@app.cell
+def _():
+    eval_config = {
+        "experiment_dir": "/home/cg5763/data/output_oneshot_memorization/less-tasks-urban-chimera",
+        "checkpoint_stride": 1000000,
+        "seqs_per_distribution": 2**6,
+        "distribution_start": 0,
+        "max_distributions": 1e4,
+        "microbatch_size": 8e4,
+        "bayes_component_chunk_size": 1e4,
+        "eval_seed": 12345,
+        "device_name": "auto",
+        "output_csv": "balanced_eval.csv",
+        "run_now": True,
+    }
+    return (eval_config,)
+
+
+@app.cell
+def _(eval_config, run_evaluation):
+    result = None
+    if eval_config["run_now"]:
+        result = run_evaluation(eval_config)
+        print(f"wrote {len(result['rows'])} rows to {result['csv_path']}")
+        print(
+            "evaluated "
+            f"{result['num_checkpoints']} checkpoints, "
+            f"{result['num_sequences']} sequences, "
+            f"{result['num_distributions']} distributions, "
+            f"device={result['device']}"
+        )
+    else:
+        print("set run_now = True in the parameter cell to run evaluation")
+    return
+
+
+if __name__ == "__main__":
+    app.run()
