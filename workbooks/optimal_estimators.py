@@ -8,6 +8,7 @@ app = marimo.App(width="medium")
 def _():
     import marimo as mo
     import torch
+    from scipy.special import digamma
 
     import sys
     sys.path.append("..")
@@ -68,7 +69,7 @@ def _(torch):
 
 
 @app.cell
-def _(counts_from_tokens, torch):
+def _(as_2d_tokens, counts_from_tokens, torch):
     class BayesOptimalEstimator:
         """Bayes optimal next-state predictor for the finite mixture generator.
 
@@ -175,6 +176,86 @@ def _(counts_from_tokens, torch):
         def predict_log_proba(self, input_ids):
             return self.predict_proba(input_ids).clamp_min(self.eps).log()
 
+        @torch.no_grad()
+        def autoregressive_losses(self, tokens, component_chunk_size=None):
+            tokens = as_2d_tokens(tokens).to(self.distributions.device)
+            if tokens.shape[1] < 2:
+                raise ValueError("tokens must contain at least two positions")
+
+            input_ids = tokens[:, :-1]
+            targets = tokens[:, 1:]
+            batch_size, input_len = input_ids.shape
+            if component_chunk_size is None:
+                component_chunk_size = self.num_distributions
+            component_chunk_size = int(component_chunk_size)
+            if component_chunk_size < 1:
+                raise ValueError("component_chunk_size must be at least 1")
+
+            counts = torch.zeros(
+                batch_size,
+                self.num_states,
+                device=self.distributions.device,
+                dtype=self.distributions.dtype,
+            )
+            losses = []
+
+            for pos in range(input_len):
+                counts.scatter_add_(
+                    dim=1,
+                    index=input_ids[:, pos : pos + 1],
+                    src=torch.ones(
+                        batch_size,
+                        1,
+                        device=self.distributions.device,
+                        dtype=self.distributions.dtype,
+                    ),
+                )
+                target = targets[:, pos]
+                log_denominator = torch.full(
+                    (batch_size,),
+                    float("-inf"),
+                    device=self.distributions.device,
+                    dtype=self.distributions.dtype,
+                )
+                log_numerator = torch.full_like(log_denominator, float("-inf"))
+
+                for chunk_start in range(
+                    0,
+                    self.num_distributions,
+                    component_chunk_size,
+                ):
+                    chunk_stop = min(
+                        self.num_distributions,
+                        chunk_start + component_chunk_size,
+                    )
+                    log_distributions = self.log_distributions[
+                        chunk_start:chunk_stop
+                    ]
+                    component_scores = (
+                        counts @ log_distributions.T
+                        + self.log_prior[chunk_start:chunk_stop]
+                    )
+                    target_log_probs = log_distributions.T[target]
+                    log_denominator = torch.logaddexp(
+                        log_denominator,
+                        torch.logsumexp(component_scores, dim=1),
+                    )
+                    log_numerator = torch.logaddexp(
+                        log_numerator,
+                        torch.logsumexp(component_scores + target_log_probs, dim=1),
+                    )
+
+                losses.append(-(log_numerator - log_denominator))
+
+            return torch.stack(losses, dim=1).mean(dim=1)
+
+        @torch.no_grad()
+        def autoregressive_loss(self, tokens, component_chunk_size=None):
+            return self.autoregressive_losses(
+                tokens,
+                component_chunk_size=component_chunk_size,
+            ).mean()
+
         __call__ = predict_proba
 
         def to(self, device):
@@ -239,6 +320,51 @@ def _(as_2d_tokens, make_alpha, torch):
         def predict_log_proba(self, input_ids):
             return self.predict_proba(input_ids).log()
 
+        @torch.no_grad()
+        def autoregressive_losses(self, tokens, eps=1e-30):
+            tokens = as_2d_tokens(tokens).to(self.device)
+            if tokens.shape[1] < 2:
+                raise ValueError("tokens must contain at least two positions")
+
+            input_ids = tokens[:, :-1]
+            targets = tokens[:, 1:]
+            batch_size, input_len = input_ids.shape
+            counts = torch.zeros(
+                batch_size,
+                self.num_states,
+                device=self.device,
+                dtype=self.dtype,
+            )
+            alpha = self.alpha.unsqueeze(0)
+            alpha_sum = self.alpha.sum()
+            losses = []
+
+            for pos in range(input_len):
+                counts.scatter_add_(
+                    dim=1,
+                    index=input_ids[:, pos : pos + 1],
+                    src=torch.ones(
+                        batch_size,
+                        1,
+                        device=self.device,
+                        dtype=self.dtype,
+                    ),
+                )
+                target_counts = (counts + alpha).gather(
+                    1,
+                    targets[:, pos : pos + 1],
+                )
+                denominator = alpha_sum + float(pos + 1)
+                losses.append(
+                    -target_counts.div(denominator).clamp_min(eps).log().squeeze(1)
+                )
+
+            return torch.stack(losses, dim=1).mean(dim=1)
+
+        @torch.no_grad()
+        def autoregressive_loss(self, tokens, eps=1e-30):
+            return self.autoregressive_losses(tokens, eps=eps).mean()
+
         __call__ = predict_proba
 
         def to(self, device):
@@ -247,6 +373,38 @@ def _(as_2d_tokens, make_alpha, torch):
             return self
 
     return (DirichletEmpiricalEstimator,)
+
+
+@app.cell
+def _(torch):
+    import torch.nn.functional as F
+    import torch.nn as nn
+
+    class UniMem(nn.Module):
+        """Retrieval with likelihood computed from unigram statistics of the context (vectorized)."""
+        def __init__(self, distributions: torch.Tensor, alpha: float, zipf_exponent: float, n_states: int):
+            super().__init__()
+            self.n_states = n_states
+            self.log_probs = torch.log(distributions)   # K, C
+            self.distributions = distributions
+            self.n_distributions = distributions.shape[0]
+            self.log_prior = -1 * zipf_exponent * torch.log(torch.arange(1, self.n_distributions + 1, device=distributions.device))  # K
+
+        def forward(self, idx, targets, return_hatT = False, reduction = 'mean'):
+            B, T = idx.shape
+            seq = F.one_hot(idx, self.n_states).float()  # B, T, C
+            cum_counts = torch.cumsum(seq, dim = 1) # B, T, C
+            cum_loglikelihood = cum_counts @ self.log_probs.T     # B, T, C @ C, K -> B, T, K
+            post = F.softmax(cum_loglikelihood + self.log_prior, dim = -1)   # constant prior can be omitted
+            hatp = torch.einsum('ijk,kp-> ijp', post, self.distributions) # B, T, K @ K, C -> B, T, C
+            logits = torch.log(hatp)
+            loss = F.cross_entropy(logits.flatten(0,1), targets.flatten(0,1), reduction = reduction)
+            if reduction == 'none':
+                loss = loss.reshape(B, T)
+
+            return logits, loss
+
+    return (UniMem,)
 
 
 @app.cell
@@ -269,12 +427,12 @@ def _(
     BayesOptimalEstimator,
     DirichletEmpiricalEstimator,
     DirichletZipfSequenceGenerator,
-    mo,
+    UniMem,
 ):
     alpha = 0.1
     num_states = 100
-    sequence_length = 100
-    num_distributions = 100_000
+    sequence_length = 257
+    num_distributions = 10_000
 
     generator = DirichletZipfSequenceGenerator(
         num_distributions=num_distributions,
@@ -284,25 +442,30 @@ def _(
     )
     tokens = generator.sample(batch_size=2**12, sequence_length=sequence_length)
 
+    uni_mem = UniMem(
+        distributions=generator.distributions,
+        alpha=alpha,
+        zipf_exponent=1.0,
+        n_states=num_states,
+    )
+
     bayes = BayesOptimalEstimator.from_generator(generator)
     empirical = DirichletEmpiricalEstimator(num_states=num_states, alpha=alpha)
 
-    bayes_probs = bayes.predict_proba(tokens[:, :-1])
-    empirical_probs = empirical.predict_proba(tokens[:, :-1])
+    # track runtimes for each estimator
+    from time import time
 
-    targets = tokens[:, -1]
-    bayes_loss = -bayes_probs.gather(1, targets[:, None]).clamp_min(1e-30).log().mean()
-    empirical_loss = (
-        -empirical_probs.gather(1, targets[:, None]).clamp_min(1e-30).log().mean()
-    )
+    start_time = time()
+    bayes_loss = bayes.autoregressive_loss(tokens, component_chunk_size=1024)
+    bayes_time = time() - start_time
+    empirical_loss = empirical.autoregressive_loss(tokens)
+    empirical_time = time() - start_time - bayes_time
+    # _, my_loss = uni_mem(tokens[:, :-1], tokens[:, 1:])
+    # uni_mem_time = time() - start_time - bayes_time - empirical_time
 
-    mo.md(
-        f"""
-        Next-state loss on the sampled batch:
-        - Bayes optimal: `{bayes_loss.item():.6f}`
-        - Dirichlet empirical baseline: `{empirical_loss.item():.6f}`
-        """
-    )
+    print("Bayes optimal loss:", bayes_loss.item(), "computed in", bayes_time, "seconds")
+    print("Dirichlet empirical loss:", empirical_loss.item(), "computed in", empirical_time, "seconds")
+    # print("UniMem loss:", my_loss.mean().item(), "computed in", uni_mem_time, "seconds")
     return
 
 
