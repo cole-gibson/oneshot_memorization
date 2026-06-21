@@ -7,14 +7,9 @@ app = marimo.App(width="medium")
 @app.cell
 def _():
     import csv
-    import os
     import re
     import sys
     from pathlib import Path
-
-    MPLCONFIGDIR = Path(f"/tmp/oneshot_memorization_matplotlib_{os.getuid()}")
-    MPLCONFIGDIR.mkdir(parents=True, exist_ok=True)
-    os.environ.setdefault("MPLCONFIGDIR", str(MPLCONFIGDIR))
 
     import matplotlib.pyplot as plt
     import torch
@@ -25,9 +20,8 @@ def _():
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
 
-    from base.data_generator import DirichletZipfSequenceGenerator
     from base.model import Transformer
-    from workbooks.optimal_estimators import (
+    from workbooks.estimators import (
         BayesOptimalEstimator,
         DirichletEmpiricalEstimator,
     )
@@ -37,7 +31,6 @@ def _():
         BayesOptimalEstimator,
         CHECKPOINT_RE,
         DirichletEmpiricalEstimator,
-        DirichletZipfSequenceGenerator,
         F,
         Path,
         Transformer,
@@ -76,10 +69,13 @@ def _(CHECKPOINT_RE, Path, torch, yaml):
             return None
         return int(match.group(1))
 
-    def list_checkpoint_paths(checkpoint_dir, file_stride):
+    def list_checkpoint_paths(checkpoint_dir, file_stride, max_checkpoints=0):
         file_stride = int(file_stride)
+        max_checkpoints = int(max_checkpoints)
         if file_stride < 1:
             raise ValueError("checkpoint stride must be at least 1")
+        if max_checkpoints < 0:
+            raise ValueError("max_checkpoints must be non-negative")
 
         checkpoint_dir = Path(checkpoint_dir)
         checkpoints = [
@@ -91,13 +87,9 @@ def _(CHECKPOINT_RE, Path, torch, yaml):
         selected = checkpoints[::file_stride]
         if checkpoints and checkpoints[-1] not in selected:
             selected.append(checkpoints[-1])
+        if max_checkpoints:
+            selected = selected[:max_checkpoints]
         return selected
-
-    def seed_torch(seed):
-        seed = int(seed)
-        torch.manual_seed(seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(seed)
 
     return (
         list_checkpoint_paths,
@@ -105,47 +97,59 @@ def _(CHECKPOINT_RE, Path, torch, yaml):
         make_torch_generator,
         parse_checkpoint_iteration,
         resolve_device,
-        seed_torch,
     )
 
 
 @app.cell
-def _(DirichletZipfSequenceGenerator, make_torch_generator, seed_torch, torch):
-    def build_generator(config, device, eval_seed):
-        data_config = config["data"]
-        seed_torch(int(config["seed"]))
-        return DirichletZipfSequenceGenerator(
-            num_distributions=data_config["num_distributions"],
-            num_states=data_config["num_states"],
-            alpha=data_config["alpha"],
-            zipf_exponent=data_config["zipf_exponent"],
-            device=device,
-            generator=make_torch_generator(device, eval_seed),
+def _(Path, make_torch_generator, torch):
+    def load_saved_distributions(experiment_dir, config, device):
+        path = Path(experiment_dir) / "distributions.pt"
+        if not path.exists():
+            raise FileNotFoundError(f"missing saved distributions: {path}")
+
+        distributions = torch.load(path, map_location=device, weights_only=True)
+        if distributions.ndim != 2:
+            raise ValueError(
+                "saved distributions must have shape "
+                "(num_distributions, num_states)"
+            )
+
+        expected_shape = (
+            int(config["data"]["num_distributions"]),
+            int(config["data"]["num_states"]),
         )
+        if tuple(distributions.shape) != expected_shape:
+            raise ValueError(
+                "saved distributions shape does not match config data "
+                f"({tuple(distributions.shape)} != {expected_shape})"
+            )
+        return distributions
 
     def make_balanced_batch(
-        generator,
+        distributions,
         batch_sequence_length,
         batch_seqs_per_distribution,
         batch_distribution_start,
         batch_max_distributions,
+        eval_seed,
     ):
         seqs_per_distribution_int = int(batch_seqs_per_distribution)
         distribution_start_int = int(batch_distribution_start)
         max_distributions_int = int(batch_max_distributions)
+        num_distributions = distributions.shape[0]
         if seqs_per_distribution_int < 1:
             raise ValueError("seqs_per_distribution must be at least 1")
         if (
             distribution_start_int < 0
-            or distribution_start_int >= generator.num_distributions
+            or distribution_start_int >= num_distributions
         ):
             raise ValueError("distribution_start must be in the distribution range")
 
         distribution_stop = (
-            generator.num_distributions
+            num_distributions
             if max_distributions_int == 0
             else min(
-                generator.num_distributions,
+                num_distributions,
                 distribution_start_int + max_distributions_int,
             )
         )
@@ -155,19 +159,21 @@ def _(DirichletZipfSequenceGenerator, make_torch_generator, seed_torch, torch):
         selected_distribution_ids = torch.arange(
             distribution_start_int,
             distribution_stop,
-            device=generator.device,
+            device=distributions.device,
             dtype=torch.long,
         )
         distribution_ids = selected_distribution_ids.repeat_interleave(
             seqs_per_distribution_int
         )
-        tokens = generator.sample_from_distribution_ids(
-            distribution_ids,
-            sequence_length=batch_sequence_length,
+        tokens = torch.multinomial(
+            distributions[distribution_ids],
+            num_samples=batch_sequence_length,
+            replacement=True,
+            generator=make_torch_generator(distributions.device, eval_seed),
         )
         return tokens.cpu(), distribution_ids.cpu(), selected_distribution_ids.cpu()
 
-    return build_generator, make_balanced_batch
+    return load_saved_distributions, make_balanced_batch
 
 
 @app.cell
@@ -434,11 +440,11 @@ def _(
 def _(
     BayesOptimalEstimator,
     Path,
-    build_generator,
     csv,
     evaluate_checkpoint,
     list_checkpoint_paths,
     load_config,
+    load_saved_distributions,
     make_balanced_batch,
     resolve_device,
 ):
@@ -481,6 +487,7 @@ def _(
         checkpoints = list_checkpoint_paths(
             checkpoint_dir,
             eval_settings["checkpoint_stride"],
+            eval_settings.get("max_checkpoints", 0),
         )
         if not checkpoints:
             raise ValueError(f"no numbered checkpoints found in {checkpoint_dir}")
@@ -489,19 +496,18 @@ def _(
         if sequence_length - 1 > int(config["model"]["max_seq_len"]):
             raise ValueError("data.sequence_length - 1 exceeds model.max_seq_len")
 
-        generator = build_generator(config, device, eval_settings["eval_seed"])
+        distributions = load_saved_distributions(experiment_dir_path, config, device)
         bayes_estimator = BayesOptimalEstimator(
-            distributions=generator.distributions,
-            distribution_weights=generator.distributions.new_ones(
-                generator.num_distributions
-            ),
+            distributions=distributions,
+            distribution_weights=distributions.new_ones(distributions.shape[0]),
         ).to(device)
         tokens, distribution_ids, selected_distribution_ids = make_balanced_batch(
-            generator=generator,
+            distributions=distributions,
             batch_sequence_length=sequence_length,
             batch_seqs_per_distribution=eval_settings["seqs_per_distribution"],
             batch_distribution_start=eval_settings["distribution_start"],
             batch_max_distributions=eval_settings["max_distributions"],
+            eval_seed=eval_settings["eval_seed"],
         )
 
         rows = []
@@ -542,13 +548,14 @@ def _(
 @app.cell
 def _():
     eval_config = {
-        "experiment_dir": "/home/cg5763/data/output_oneshot_memorization/less-tasks-urban-chimera",
-        "checkpoint_stride": 1000000,
+        "experiment_dir": "/home/cg5763/data/output_oneshot_memorization/less-tasks-private-eel",
+        "checkpoint_stride": 1,
+        "max_checkpoints": 500,
         "seqs_per_distribution": 2**6,
         "distribution_start": 0,
-        "max_distributions": 1e4,
+        "max_distributions": 500,
         "microbatch_size": 8e4,
-        "bayes_component_chunk_size": 1e4,
+        "bayes_component_chunk_size": 500,
         "eval_seed": 12345,
         "device_name": "auto",
         "output_csv": "balanced_eval.csv",
