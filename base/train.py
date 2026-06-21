@@ -10,7 +10,14 @@ import torch
 import yaml
 
 from base.data_generator import DirichletZipfSequenceGenerator
-from base.model import Transformer
+from base.minimal_model import Transformer as MinimalTransformer
+from base.model import Transformer as FullTransformer
+
+
+MODEL_TYPES = {
+    "full": FullTransformer,
+    "minimal": MinimalTransformer,
+}
 
 
 def parse_args():
@@ -70,6 +77,13 @@ def seed_everything(seed):
 def validate_config(config):
     model_config = config["model"]
     data_config = config["data"]
+    model_type = model_config.get("type", "full")
+
+    if model_type not in MODEL_TYPES:
+        raise ValueError(
+            "model.type must be one of "
+            f"{sorted(MODEL_TYPES)}; got {model_type!r}"
+        )
 
     if data_config["num_states"] != model_config["vocab_size"]:
         raise ValueError(
@@ -167,6 +181,12 @@ def save_checkpoint(
     torch.save(checkpoint, path)
 
 
+def save_distributions_once(run_dir, data_generator):
+    path = run_dir / "distributions.pt"
+    if not path.exists():
+        torch.save(data_generator.distributions.cpu(), path)
+
+
 def append_log_row(log_path, row):
     file_exists = log_path.exists()
     with log_path.open("a", newline="", encoding="utf-8") as log_file:
@@ -185,6 +205,12 @@ def build_optimizer(model, optimizer_config):
     )
 
 
+def build_model(model_config):
+    model_config = dict(model_config)
+    model_type = model_config.pop("type", "full")
+    return MODEL_TYPES[model_type](**model_config)
+
+
 def main():
     args = parse_args()
     config = load_config(args.config)
@@ -199,7 +225,7 @@ def main():
     seed_everything(seed)
     device = resolve_device(config.get("device", "auto"))
 
-    model = Transformer(**config["model"]).to(device)
+    model = build_model(config["model"]).to(device)
     optimizer = build_optimizer(model, config["optimizer"])
 
     data_generator = DirichletZipfSequenceGenerator(
@@ -237,6 +263,8 @@ def main():
                     "checkpoint distribution_use_counts length does not match "
                     "data.num_distributions"
                 )
+
+    save_distributions_once(run_dir, data_generator)
 
     if args.run_dir_file is not None:
         args.run_dir_file.parent.mkdir(parents=True, exist_ok=True)
