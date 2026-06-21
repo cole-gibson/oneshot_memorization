@@ -14,12 +14,13 @@ def _():
     sys.path.append("..")
 
     from base.data_generator import DirichletZipfSequenceGenerator
-    from estimators import BayesOptimalEstimator, DirichletEmpiricalEstimator
+    from base.estimators import BayesOptimalEstimator, DirichletEmpiricalEstimator
 
     return (
         BayesOptimalEstimator,
         DirichletEmpiricalEstimator,
         DirichletZipfSequenceGenerator,
+        digamma,
         mo,
         torch,
     )
@@ -78,10 +79,12 @@ def _(
     DirichletEmpiricalEstimator,
     DirichletZipfSequenceGenerator,
     UniMem,
+    digamma,
+    torch,
 ):
     alpha = 0.1
     num_states = 100
-    sequence_length = 257
+    sequence_length = 32
     num_distributions = 10_000
 
     generator = DirichletZipfSequenceGenerator(
@@ -115,6 +118,11 @@ def _(
 
     print("Bayes optimal loss:", bayes_loss.item(), "computed in", bayes_time, "seconds")
     print("Dirichlet empirical loss:", empirical_loss.item(), "computed in", empirical_time, "seconds")
+
+    print("Loss difference (Random - Empirical):", (torch.log(torch.tensor(num_states)) - empirical_loss).item())
+    print("Loss difference (Empirical - Bayes):", (empirical_loss - bayes_loss).item())
+    entropy = digamma(num_states * alpha + 1) - digamma(alpha + 1)
+    print("Loss difference (Bayes - Oracle):", (bayes_loss - entropy).item())
     # print("UniMem loss:", my_loss.mean().item(), "computed in", uni_mem_time, "seconds")
     return
 
