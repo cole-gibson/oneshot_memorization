@@ -6,6 +6,7 @@ app = marimo.App(width="medium")
 
 @app.cell
 def _():
+    import argparse
     import csv
     import re
     import sys
@@ -20,28 +21,35 @@ def _():
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
 
-    from base.model import Transformer
-    from workbooks.estimators import (
+    from base.minimal_model import Transformer as MinimalTransformer
+    from base.model import Transformer as FullTransformer
+    from base.estimators import (
         BayesOptimalEstimator,
         DirichletEmpiricalEstimator,
     )
 
     CHECKPOINT_RE = re.compile(r"checkpoint_(\d+)\.pt$")
+    MODEL_TYPES = {
+        "full": FullTransformer,
+        "minimal": MinimalTransformer,
+    }
     return (
+        MODEL_TYPES,
         BayesOptimalEstimator,
         CHECKPOINT_RE,
         DirichletEmpiricalEstimator,
         F,
         Path,
-        Transformer,
+        argparse,
         csv,
+        sys,
         torch,
         yaml,
     )
 
 
 @app.cell
-def _(CHECKPOINT_RE, Path, torch, yaml):
+def _(CHECKPOINT_RE, MODEL_TYPES, Path, argparse, torch, yaml):
     def load_config(path):
         with path.open("r", encoding="utf-8") as config_file:
             config = yaml.safe_load(config_file)
@@ -91,10 +99,39 @@ def _(CHECKPOINT_RE, Path, torch, yaml):
             selected = selected[:max_checkpoints]
         return selected
 
+    def build_model(model_config):
+        model_config = dict(model_config)
+        model_type = model_config.pop("type", "full")
+        if model_type not in MODEL_TYPES:
+            raise ValueError(
+                "model.type must be one of "
+                f"{sorted(MODEL_TYPES)}; got {model_type!r}"
+            )
+        return MODEL_TYPES[model_type](**model_config)
+
+    def parse_eval_args(argv):
+        parser = argparse.ArgumentParser(description="Evaluate a training run.")
+        parser.add_argument(
+            "experiment_dir",
+            nargs="?",
+            default=None,
+            help="Experiment directory containing config.yaml and checkpoints/.",
+        )
+        parser.add_argument(
+            "--experiment-dir",
+            dest="experiment_dir_option",
+            default=None,
+            help="Experiment directory containing config.yaml and checkpoints/.",
+        )
+        args, _ = parser.parse_known_args(argv)
+        return args.experiment_dir_option or args.experiment_dir
+
     return (
+        build_model,
         list_checkpoint_paths,
         load_config,
         make_torch_generator,
+        parse_eval_args,
         parse_checkpoint_iteration,
         resolve_device,
     )
@@ -302,7 +339,7 @@ def _(F, torch):
 @app.cell
 def _(
     DirichletEmpiricalEstimator,
-    Transformer,
+    build_model,
     bayes_autoregressive_losses,
     dirichlet_autoregressive_losses,
     model_autoregressive_losses,
@@ -321,7 +358,7 @@ def _(
         device,
     ):
         checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-        model = Transformer(**config["model"]).to(device)
+        model = build_model(config["model"]).to(device)
         model.load_state_dict(checkpoint["model_state"])
         model.eval()
 
@@ -546,9 +583,13 @@ def _(
 
 
 @app.cell
-def _():
+def _(parse_eval_args, sys):
+    experiment_dir = (
+        parse_eval_args(sys.argv[1:])
+        or "/home/cg5763/data/output_oneshot_memorization/less-tasks-private-eel"
+    )
     eval_config = {
-        "experiment_dir": "/home/cg5763/data/output_oneshot_memorization/less-tasks-private-eel",
+        "experiment_dir": experiment_dir,
         "checkpoint_stride": 1,
         "max_checkpoints": 500,
         "seqs_per_distribution": 2**6,
