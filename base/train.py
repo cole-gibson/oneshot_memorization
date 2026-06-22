@@ -77,6 +77,7 @@ def seed_everything(seed):
 def validate_config(config):
     model_config = config["model"]
     data_config = config["data"]
+    training_config = config["training"]
     model_type = model_config.get("type", "full")
 
     if model_type not in MODEL_TYPES:
@@ -101,9 +102,48 @@ def validate_config(config):
             f"({input_seq_len} > {model_config['max_seq_len']})"
         )
 
-    checkpoint_interval = config["training"]["checkpoint_interval"]
-    if checkpoint_interval < 1:
+    has_checkpoint_interval = training_config.get("checkpoint_interval") is not None
+    has_checkpoint_log_count = training_config.get("checkpoint_log_count") is not None
+    if has_checkpoint_interval == has_checkpoint_log_count:
+        raise ValueError(
+            "training must set exactly one of checkpoint_interval or "
+            "checkpoint_log_count"
+        )
+
+    if has_checkpoint_interval and training_config["checkpoint_interval"] < 1:
         raise ValueError("training.checkpoint_interval must be at least 1")
+
+    if has_checkpoint_log_count:
+        checkpoint_log_count = training_config["checkpoint_log_count"]
+        if checkpoint_log_count < 1:
+            raise ValueError("training.checkpoint_log_count must be at least 1")
+        if checkpoint_log_count > training_config["max_iters"]:
+            raise ValueError(
+                "training.checkpoint_log_count must be <= training.max_iters"
+            )
+
+
+def build_checkpoint_iterations(training_config):
+    max_iters = int(training_config["max_iters"])
+    checkpoint_interval = training_config.get("checkpoint_interval")
+    if checkpoint_interval is not None:
+        return set(range(int(checkpoint_interval), max_iters + 1, int(checkpoint_interval)))
+
+    checkpoint_log_count = int(training_config["checkpoint_log_count"])
+    if checkpoint_log_count == 1:
+        return {max_iters}
+
+    targets = np.geomspace(1, max_iters, num=checkpoint_log_count)
+    checkpoint_iterations = []
+    for index, target in enumerate(targets):
+        remaining = checkpoint_log_count - index - 1
+        min_iteration = checkpoint_iterations[-1] + 1 if checkpoint_iterations else 1
+        max_iteration = max_iters - remaining
+        iteration = int(round(target))
+        checkpoint_iterations.append(
+            min(max(iteration, min_iteration), max_iteration)
+        )
+    return set(checkpoint_iterations)
 
 
 def slugify(text):
@@ -222,20 +262,7 @@ def main():
     resume_from = Path(resume_from) if resume_from else None
 
     seed = int(config["seed"])
-    seed_everything(seed)
     device = resolve_device(config.get("device", "auto"))
-
-    model = build_model(config["model"]).to(device)
-    optimizer = build_optimizer(model, config["optimizer"])
-
-    data_generator = DirichletZipfSequenceGenerator(
-        num_distributions=config["data"]["num_distributions"],
-        num_states=config["data"]["num_states"],
-        alpha=config["data"]["alpha"],
-        zipf_exponent=config["data"]["zipf_exponent"],
-        device=device,
-        generator=make_torch_generator(device, seed),
-    )
 
     start_iter = 0
     distribution_use_counts = torch.zeros(
@@ -248,10 +275,25 @@ def main():
             yaml.safe_dump(config, config_file, sort_keys=False)
     else:
         checkpoint = torch.load(resume_from, map_location="cpu", weights_only=False)
+        run_dir = Path(checkpoint.get("run_dir", resume_from.parent))
+
+    seed_everything(seed)
+    model = build_model(config["model"]).to(device)
+    optimizer = build_optimizer(model, config["optimizer"])
+
+    data_generator = DirichletZipfSequenceGenerator(
+        num_distributions=config["data"]["num_distributions"],
+        num_states=config["data"]["num_states"],
+        alpha=config["data"]["alpha"],
+        zipf_exponent=config["data"]["zipf_exponent"],
+        device=device,
+        generator=make_torch_generator(device, seed),
+    )
+
+    if resume_from is not None:
         model.load_state_dict(checkpoint["model_state"])
         optimizer.load_state_dict(checkpoint["optimizer_state"])
         start_iter = int(checkpoint["iteration"])
-        run_dir = Path(checkpoint.get("run_dir", resume_from.parent))
         set_rng_state(checkpoint.get("rng_state"), data_generator)
         if "distribution_use_counts" in checkpoint:
             distribution_use_counts = checkpoint["distribution_use_counts"].to(
@@ -279,7 +321,7 @@ def main():
     last_checkpoint_iter = start_iter
 
     max_iters = int(config["training"]["max_iters"])
-    checkpoint_interval = int(config["training"]["checkpoint_interval"])
+    checkpoint_iterations = build_checkpoint_iterations(config["training"])
     grad_clip_norm = config["training"].get("grad_clip_norm")
 
     for iteration in range(start_iter + 1, max_iters + 1):
@@ -315,7 +357,7 @@ def main():
             },
         )
 
-        if iteration % checkpoint_interval == 0:
+        if iteration in checkpoint_iterations:
             numbered_path = checkpoint_dir / f"checkpoint_{iteration:06d}.pt"
             latest_path = checkpoint_dir / "latest.pt"
             save_checkpoint(
