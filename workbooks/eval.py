@@ -34,11 +34,11 @@ def _():
         "minimal": MinimalTransformer,
     }
     return (
-        MODEL_TYPES,
         BayesOptimalEstimator,
         CHECKPOINT_RE,
         DirichletEmpiricalEstimator,
         F,
+        MODEL_TYPES,
         Path,
         argparse,
         csv,
@@ -131,8 +131,8 @@ def _(CHECKPOINT_RE, MODEL_TYPES, Path, argparse, torch, yaml):
         list_checkpoint_paths,
         load_config,
         make_torch_generator,
-        parse_eval_args,
         parse_checkpoint_iteration,
+        parse_eval_args,
         resolve_device,
     )
 
@@ -339,8 +339,8 @@ def _(F, torch):
 @app.cell
 def _(
     DirichletEmpiricalEstimator,
-    build_model,
     bayes_autoregressive_losses,
+    build_model,
     dirichlet_autoregressive_losses,
     model_autoregressive_losses,
     parse_checkpoint_iteration,
@@ -591,7 +591,7 @@ def _(parse_eval_args, sys):
     eval_config = {
         "experiment_dir": experiment_dir,
         "checkpoint_stride": 1,
-        "max_checkpoints": 500,
+        "max_checkpoints": 1000,
         "seqs_per_distribution": 2**6,
         "distribution_start": 0,
         "max_distributions": 500,
