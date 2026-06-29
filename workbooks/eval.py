@@ -97,6 +97,8 @@ def _(CHECKPOINT_RE, MODEL_TYPES, Path, argparse, torch, yaml):
             selected.append(checkpoints[-1])
         if max_checkpoints:
             selected = selected[:max_checkpoints]
+            if checkpoints and checkpoints[-1] not in selected:
+                selected[-1] = checkpoints[-1]
         return selected
 
     def build_model(model_config):
@@ -215,40 +217,6 @@ def _(Path, make_torch_generator, torch):
 
 @app.cell
 def _(F, torch):
-    def dirichlet_autoregressive_losses(tokens, estimator, eps=1e-30):
-        tokens = tokens.to(estimator.device)
-        input_ids = tokens[:, :-1]
-        targets = tokens[:, 1:]
-        batch_size, input_len = input_ids.shape
-        counts = torch.zeros(
-            batch_size,
-            estimator.num_states,
-            device=estimator.device,
-            dtype=estimator.dtype,
-        )
-        alpha = estimator.alpha.unsqueeze(0)
-        alpha_sum = estimator.alpha.sum()
-        losses = []
-
-        for pos in range(input_len):
-            counts.scatter_add_(
-                dim=1,
-                index=input_ids[:, pos : pos + 1],
-                src=torch.ones(
-                    batch_size,
-                    1,
-                    device=estimator.device,
-                    dtype=estimator.dtype,
-                ),
-            )
-            target_counts = (counts + alpha).gather(1, targets[:, pos : pos + 1])
-            denominator = alpha_sum + float(pos + 1)
-            losses.append(
-                -target_counts.div(denominator).clamp_min(eps).log().squeeze(1)
-            )
-
-        return torch.stack(losses, dim=1).mean(dim=1)
-
     @torch.no_grad()
     def model_autoregressive_losses(model, tokens):
         input_ids = tokens[:, :-1]
@@ -261,87 +229,13 @@ def _(F, torch):
         )
         return losses.mean(dim=1)
 
-    @torch.no_grad()
-    def bayes_autoregressive_losses(tokens, estimator, component_chunk_size):
-        tokens = tokens.to(estimator.distributions.device)
-        input_ids = tokens[:, :-1]
-        targets = tokens[:, 1:]
-        batch_size, input_len = input_ids.shape
-        component_chunk_size = int(component_chunk_size)
-        if component_chunk_size < 1:
-            raise ValueError("component_chunk_size must be at least 1")
-
-        counts = torch.zeros(
-            batch_size,
-            estimator.num_states,
-            device=estimator.distributions.device,
-            dtype=estimator.distributions.dtype,
-        )
-        losses = []
-
-        for pos in range(input_len):
-            counts.scatter_add_(
-                dim=1,
-                index=input_ids[:, pos : pos + 1],
-                src=torch.ones(
-                    batch_size,
-                    1,
-                    device=estimator.distributions.device,
-                    dtype=estimator.distributions.dtype,
-                ),
-            )
-            target = targets[:, pos]
-            log_denominator = torch.full(
-                (batch_size,),
-                float("-inf"),
-                device=estimator.distributions.device,
-                dtype=estimator.distributions.dtype,
-            )
-            log_numerator = torch.full_like(log_denominator, float("-inf"))
-
-            for chunk_start in range(
-                0,
-                estimator.num_distributions,
-                component_chunk_size,
-            ):
-                chunk_stop = min(
-                    estimator.num_distributions,
-                    chunk_start + component_chunk_size,
-                )
-                log_distributions = estimator.log_distributions[
-                    chunk_start:chunk_stop
-                ]
-                component_scores = (
-                    counts @ log_distributions.T
-                    + estimator.log_prior[chunk_start:chunk_stop]
-                )
-                target_log_probs = log_distributions.T[target]
-                log_denominator = torch.logaddexp(
-                    log_denominator,
-                    torch.logsumexp(component_scores, dim=1),
-                )
-                log_numerator = torch.logaddexp(
-                    log_numerator,
-                    torch.logsumexp(component_scores + target_log_probs, dim=1),
-                )
-
-            losses.append(-(log_numerator - log_denominator))
-
-        return torch.stack(losses, dim=1).mean(dim=1)
-
-    return (
-        bayes_autoregressive_losses,
-        dirichlet_autoregressive_losses,
-        model_autoregressive_losses,
-    )
+    return (model_autoregressive_losses,)
 
 
 @app.cell
 def _(
     DirichletEmpiricalEstimator,
-    bayes_autoregressive_losses,
     build_model,
-    dirichlet_autoregressive_losses,
     model_autoregressive_losses,
     parse_checkpoint_iteration,
     torch,
@@ -398,14 +292,12 @@ def _(
             batch_distribution_ids = distribution_ids[start:stop]
 
             model_losses = model_autoregressive_losses(model, batch_tokens).cpu()
-            dirichlet_losses = dirichlet_autoregressive_losses(
-                batch_tokens,
-                dirichlet_estimator,
+            dirichlet_losses = dirichlet_estimator.autoregressive_losses(
+                batch_tokens
             ).cpu()
-            bayes_losses = bayes_autoregressive_losses(
+            bayes_losses = bayes_estimator.autoregressive_losses(
                 batch_tokens,
-                bayes_estimator,
-                bayes_component_chunk_size,
+                component_chunk_size=bayes_component_chunk_size,
             ).cpu()
             dirichlet_gaps = model_losses - dirichlet_losses
             bayes_gaps = model_losses - bayes_losses
@@ -534,9 +426,13 @@ def _(
             raise ValueError("data.sequence_length - 1 exceeds model.max_seq_len")
 
         distributions = load_saved_distributions(experiment_dir_path, config, device)
+        distribution_weights = distributions.new_ones(distributions.shape[0]).cumsum(0)
+        distribution_weights = distribution_weights.pow(
+            -float(config["data"]["zipf_exponent"])
+        )
         bayes_estimator = BayesOptimalEstimator(
             distributions=distributions,
-            distribution_weights=distributions.new_ones(distributions.shape[0]),
+            distribution_weights=distribution_weights,
         ).to(device)
         tokens, distribution_ids, selected_distribution_ids = make_balanced_batch(
             distributions=distributions,

@@ -172,12 +172,7 @@ class BayesOptimalEstimator:
             counts.scatter_add_(
                 dim=1,
                 index=input_ids[:, pos : pos + 1],
-                src=torch.ones(
-                    batch_size,
-                    1,
-                    device=self.distributions.device,
-                    dtype=self.distributions.dtype,
-                ),
+                src=counts.new_ones(batch_size, 1),
             )
             target = targets[:, pos]
             log_denominator = torch.full(
@@ -247,28 +242,10 @@ class DirichletEmpiricalEstimator:
 
     @torch.no_grad()
     def predict_proba(self, input_ids):
-        input_ids = as_2d_tokens(input_ids)
-        if input_ids.numel() > 0:
-            if input_ids.min() < 0 or input_ids.max() >= self.num_states:
-                raise ValueError("input_ids contain states outside [0, num_states)")
-
-        counts = torch.zeros(
-            input_ids.shape[0],
+        counts = counts_from_tokens(
+            as_2d_tokens(input_ids).to(self.device),
             self.num_states,
-            device=self.device,
-            dtype=self.dtype,
-        )
-        if input_ids.numel() > 0:
-            counts.scatter_add_(
-                dim=1,
-                index=input_ids.to(self.device),
-                src=torch.ones(
-                    input_ids.shape,
-                    device=self.device,
-                    dtype=self.dtype,
-                ),
-            )
-
+        ).to(dtype=self.dtype)
         posterior_counts = counts + self.alpha
         return posterior_counts / posterior_counts.sum(dim=-1, keepdim=True)
 
@@ -299,12 +276,7 @@ class DirichletEmpiricalEstimator:
             counts.scatter_add_(
                 dim=1,
                 index=input_ids[:, pos : pos + 1],
-                src=torch.ones(
-                    batch_size,
-                    1,
-                    device=self.device,
-                    dtype=self.dtype,
-                ),
+                src=counts.new_ones(batch_size, 1),
             )
             target_counts = (counts + alpha).gather(1, targets[:, pos : pos + 1])
             denominator = alpha_sum + float(pos + 1)

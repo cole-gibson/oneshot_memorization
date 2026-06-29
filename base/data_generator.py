@@ -19,6 +19,7 @@ class DirichletZipfSequenceGenerator:
         device=None,
         dtype=torch.float32,
         generator=None,
+        distributions=None,
     ):
         if num_distributions < 1:
             raise ValueError("num_distributions must be at least 1")
@@ -33,14 +34,22 @@ class DirichletZipfSequenceGenerator:
         self.dtype = dtype
         self.generator = generator
 
-        concentration = self._make_concentration(alpha)
-        self.distributions = torch.distributions.Dirichlet(concentration).sample(
-            (num_distributions,)
-        )
+        if distributions is None:
+            concentration = self._make_concentration(alpha)
+            self.distributions = self._sample_dirichlet(concentration)
+        else:
+            self.distributions = self._make_distributions(distributions)
 
         ranks = torch.arange(1, num_distributions + 1, device=self.device, dtype=dtype)
         self.distribution_weights = ranks.pow(-zipf_exponent)
         self.distribution_weights /= self.distribution_weights.sum()
+
+    def _sample_dirichlet(self, concentration):
+        gamma_samples = torch._standard_gamma(
+            concentration.expand(self.num_distributions, self.num_states),
+            generator=self.generator,
+        )
+        return gamma_samples / gamma_samples.sum(dim=-1, keepdim=True)
 
     def _make_concentration(self, alpha):
         alpha = torch.as_tensor(alpha, device=self.device, dtype=self.dtype)
@@ -52,6 +61,24 @@ class DirichletZipfSequenceGenerator:
         if alpha.shape != (self.num_states,):
             raise ValueError("alpha must be a scalar or a tensor with shape (num_states,)")
         return alpha
+
+    def _make_distributions(self, distributions):
+        distributions = torch.as_tensor(
+            distributions,
+            device=self.device,
+            dtype=self.dtype,
+        )
+        if distributions.shape != (self.num_distributions, self.num_states):
+            raise ValueError(
+                "distributions must have shape "
+                "(num_distributions, num_states)"
+            )
+        if torch.any(distributions < 0):
+            raise ValueError("distributions must be non-negative")
+        row_sums = distributions.sum(dim=1, keepdim=True)
+        if torch.any(row_sums <= 0):
+            raise ValueError("each distribution must have positive mass")
+        return distributions / row_sums
 
     @torch.no_grad()
     def sample(self, batch_size, sequence_length, return_distribution_ids=False):

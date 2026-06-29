@@ -217,6 +217,7 @@ def save_checkpoint(
         "run_dir": str(run_dir),
         "rng_state": get_rng_state(data_generator),
         "distribution_use_counts": distribution_use_counts.cpu(),
+        "distributions": data_generator.distributions.cpu(),
     }
     torch.save(checkpoint, path)
 
@@ -225,6 +226,26 @@ def save_distributions_once(run_dir, data_generator):
     path = run_dir / "distributions.pt"
     if not path.exists():
         torch.save(data_generator.distributions.cpu(), path)
+
+
+def load_resume_distributions(checkpoint, run_dir, config, device):
+    distributions = checkpoint.get("distributions")
+    if distributions is None:
+        path = run_dir / "distributions.pt"
+        if not path.exists():
+            return None
+        distributions = torch.load(path, map_location=device, weights_only=True)
+
+    expected_shape = (
+        int(config["data"]["num_distributions"]),
+        int(config["data"]["num_states"]),
+    )
+    if tuple(distributions.shape) != expected_shape:
+        raise ValueError(
+            "resume distributions shape does not match config data "
+            f"({tuple(distributions.shape)} != {expected_shape})"
+        )
+    return distributions.to(device)
 
 
 def append_log_row(log_path, row):
@@ -288,6 +309,11 @@ def main():
         zipf_exponent=config["data"]["zipf_exponent"],
         device=device,
         generator=make_torch_generator(device, seed),
+        distributions=(
+            load_resume_distributions(checkpoint, run_dir, config, device)
+            if resume_from is not None
+            else None
+        ),
     )
 
     if resume_from is not None:
@@ -360,26 +386,17 @@ def main():
         if iteration in checkpoint_iterations:
             numbered_path = checkpoint_dir / f"checkpoint_{iteration:06d}.pt"
             latest_path = checkpoint_dir / "latest.pt"
-            save_checkpoint(
-                numbered_path,
-                model,
-                optimizer,
-                iteration,
-                config,
-                run_dir,
-                data_generator,
-                distribution_use_counts,
-            )
-            save_checkpoint(
-                latest_path,
-                model,
-                optimizer,
-                iteration,
-                config,
-                run_dir,
-                data_generator,
-                distribution_use_counts,
-            )
+            for checkpoint_path in (numbered_path, latest_path):
+                save_checkpoint(
+                    checkpoint_path,
+                    model,
+                    optimizer,
+                    iteration,
+                    config,
+                    run_dir,
+                    data_generator,
+                    distribution_use_counts,
+                )
             now = time.perf_counter()
             checkpoint_iters = iteration - last_checkpoint_iter
             seconds_per_iter = (now - last_checkpoint_time) / checkpoint_iters
