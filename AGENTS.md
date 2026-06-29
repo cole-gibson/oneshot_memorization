@@ -1,3 +1,5 @@
+This codebase is designed for numerical experiments for scientific research and exploration.
+
 This project uses a virtual environment at .venv/. Run python through the venv.
 
 ## 1. Think Before Coding
