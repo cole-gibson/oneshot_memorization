@@ -19,8 +19,8 @@ class Transformer(nn.Module):
         super().__init__()
         if num_layers != 1:
             raise ValueError("minimal_model.Transformer only supports num_layers=1")
-        if mlp_num_layers < 1:
-            raise ValueError("mlp_num_layers must be at least 1")
+        if mlp_num_layers < 0:
+            raise ValueError("mlp_num_layers must be nonnegative")
         if not causal:
             raise ValueError("minimal_model.Transformer only supports causal=True")
 
@@ -30,18 +30,14 @@ class Transformer(nn.Module):
         self.token_embedding = nn.Embedding(vocab_size, embed_dim)
 
         hidden_dim = mlp_ratio * embed_dim
-        if mlp_num_layers == 1:
+        if mlp_num_layers == 0:
             layers = [nn.Linear(embed_dim, vocab_size)]
         else:
-            layers = [
-                nn.Linear(embed_dim, hidden_dim),
-                nn.GELU(),
-                nn.Dropout(dropout),
-            ]
-            for _ in range(mlp_num_layers - 2):
+            layers = []
+            for i in range(mlp_num_layers):
                 layers.extend(
                     [
-                        nn.Linear(hidden_dim, hidden_dim),
+                        nn.Linear(embed_dim if i == 0 else hidden_dim, hidden_dim),
                         nn.GELU(),
                         nn.Dropout(dropout),
                     ]
@@ -98,7 +94,7 @@ if __name__ == "__main__":
         vocab_size=128,
         max_seq_len=64,
         embed_dim=128,
-        mlp_num_layers=3,
+        mlp_num_layers=2,
         dropout=0.1,
     )
 

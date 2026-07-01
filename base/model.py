@@ -54,28 +54,23 @@ class MultiHeadSelfAttention(nn.Module):
 
 
 class FeedForward(nn.Module):
-    def __init__(self, embed_dim, hidden_dim, num_layers=2, dropout=0.0):
+    def __init__(self, embed_dim, hidden_dim, num_hidden_layers=1, dropout=0.0):
         super().__init__()
-        if num_layers < 1:
-            raise ValueError("num_layers must be at least 1")
+        if num_hidden_layers < 0:
+            raise ValueError("num_hidden_layers must be nonnegative")
 
-        if num_layers == 1:
+        if num_hidden_layers == 0:
             self.net = nn.Sequential(
                 nn.Linear(embed_dim, embed_dim),
                 nn.Dropout(dropout),
             )
             return
 
-        layers = [
-            nn.Linear(embed_dim, hidden_dim),
-            nn.GELU(),
-            nn.Dropout(dropout),
-        ]
-
-        for _ in range(num_layers - 2):
+        layers = []
+        for i in range(num_hidden_layers):
             layers.extend(
                 [
-                    nn.Linear(hidden_dim, hidden_dim),
+                    nn.Linear(embed_dim if i == 0 else hidden_dim, hidden_dim),
                     nn.GELU(),
                     nn.Dropout(dropout),
                 ]
@@ -115,7 +110,7 @@ class TransformerBlock(nn.Module):
         self.feed_forward = FeedForward(
             embed_dim=embed_dim,
             hidden_dim=mlp_ratio * embed_dim,
-            num_layers=mlp_num_layers,
+            num_hidden_layers=mlp_num_layers,
             dropout=dropout,
         )
 
@@ -205,7 +200,7 @@ if __name__ == "__main__":
         embed_dim=128,
         num_heads=4,
         num_layers=4,
-        mlp_num_layers=3,
+        mlp_num_layers=2,
         dropout=0.1,
     )
 
