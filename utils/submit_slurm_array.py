@@ -109,6 +109,7 @@ def write_sbatch(path, args, manifest_path, log_dir, num_jobs):
 
 def main():
     args = parse_args()
+    repo_root = Path.cwd().resolve()
     config_paths = sorted(args.config_dir.glob("*.yaml")) + sorted(
         args.config_dir.glob("*.yml")
     )
@@ -120,7 +121,7 @@ def main():
     experiment_dir = args.output_root / f"{slug(experiment_name)}-{coolname.generate_slug(2)}"
     configs_dir = experiment_dir / "configs"
     runs_dir = experiment_dir / "runs"
-    log_dir = experiment_dir / "slurm_logs"
+    log_dir = repo_root / "logs" / "slurm" / experiment_dir.name
     configs_dir.mkdir(parents=True, exist_ok=False)
     runs_dir.mkdir(parents=True, exist_ok=True)
     log_dir.mkdir(parents=True, exist_ok=True)
