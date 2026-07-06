@@ -23,6 +23,7 @@ def parse_args():
     parser.add_argument("--mem", default=None)
     parser.add_argument("--cpus-per-task", type=int, default=None)
     parser.add_argument("--gpus", default=None)
+    parser.add_argument("--gres", default=None)
     parser.add_argument("--constraint", default=None)
     parser.add_argument("--dry-run", action="store_true")
     return parser.parse_args()
@@ -76,6 +77,7 @@ def write_sbatch(path, args, manifest_path, log_dir, num_jobs):
         *sbatch_line("mem", args.mem),
         *sbatch_line("cpus-per-task", args.cpus_per_task),
         *sbatch_line("gpus", args.gpus),
+        *sbatch_line("gres", args.gres),
         *sbatch_line("constraint", args.constraint),
         "",
         "set -euo pipefail",
