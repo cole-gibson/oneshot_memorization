@@ -160,6 +160,110 @@ class DirichletZipfSequenceGenerator:
         return self
 
 
+class DirichletZipfBinaryClassificationGenerator(DirichletZipfSequenceGenerator):
+    """Generate sequence-label pairs from Zipf-selected Dirichlet components.
+
+    Each component receives a fixed binary label. A sampled sequence inherits
+    the label of the component that generated its states.
+    """
+
+    def __init__(
+        self,
+        num_distributions,
+        num_states,
+        alpha,
+        zipf_exponent,
+        device=None,
+        dtype=torch.float32,
+        generator=None,
+        distributions=None,
+        distribution_labels=None,
+    ):
+        super().__init__(
+            num_distributions=num_distributions,
+            num_states=num_states,
+            alpha=alpha,
+            zipf_exponent=zipf_exponent,
+            device=device,
+            dtype=dtype,
+            generator=generator,
+            distributions=distributions,
+        )
+        if distribution_labels is None:
+            self.distribution_labels = torch.randint(
+                0,
+                2,
+                (self.num_distributions,),
+                device=self.device,
+                generator=self.generator,
+            )
+        else:
+            self.distribution_labels = self._make_distribution_labels(
+                distribution_labels
+            )
+
+    def _make_distribution_labels(self, distribution_labels):
+        distribution_labels = torch.as_tensor(
+            distribution_labels,
+            device=self.device,
+        )
+        if distribution_labels.shape != (self.num_distributions,):
+            raise ValueError(
+                "distribution_labels must have shape (num_distributions,)"
+            )
+        if distribution_labels.min() < 0 or distribution_labels.max() > 1:
+            raise ValueError("distribution_labels must contain only binary labels")
+        return distribution_labels.to(dtype=torch.long)
+
+    @torch.no_grad()
+    def sample(
+        self,
+        batch_size,
+        sequence_length,
+        return_distribution_ids=False,
+        return_labels=False,
+    ):
+        tokens, distribution_ids = super().sample(
+            batch_size=batch_size,
+            sequence_length=sequence_length,
+            return_distribution_ids=True,
+        )
+        labels = self.distribution_labels[distribution_ids]
+
+        if return_distribution_ids and return_labels:
+            return tokens, distribution_ids, labels
+        if return_distribution_ids:
+            return tokens, distribution_ids
+        if return_labels:
+            return tokens, labels
+        return tokens
+
+    @torch.no_grad()
+    def sample_from_distribution_ids(
+        self,
+        distribution_ids,
+        sequence_length,
+        return_labels=False,
+    ):
+        tokens = super().sample_from_distribution_ids(
+            distribution_ids=distribution_ids,
+            sequence_length=sequence_length,
+        )
+        if return_labels:
+            distribution_ids = torch.as_tensor(
+                distribution_ids,
+                device=self.device,
+                dtype=torch.long,
+            )
+            return tokens, self.distribution_labels[distribution_ids]
+        return tokens
+
+    def to(self, device):
+        super().to(device)
+        self.distribution_labels = self.distribution_labels.to(self.device)
+        return self
+
+
 if __name__ == "__main__":
     generator = DirichletZipfSequenceGenerator(
         num_distributions=100,

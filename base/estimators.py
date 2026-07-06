@@ -229,6 +229,77 @@ class BayesOptimalEstimator:
         return self
 
 
+class BayesOptimalDistributionLabelClassifier(BayesOptimalEstimator):
+    """Bayes optimal classifier for labels attached to components."""
+
+    def __init__(
+        self,
+        distributions,
+        distribution_labels,
+        distribution_weights=None,
+        ranks=None,
+        zipf_exponent=None,
+        num_classes=None,
+        eps=1e-30,
+    ):
+        super().__init__(
+            distributions=distributions,
+            distribution_weights=distribution_weights,
+            ranks=ranks,
+            zipf_exponent=zipf_exponent,
+            eps=eps,
+        )
+        distribution_labels = torch.as_tensor(
+            distribution_labels,
+            device=self.distributions.device,
+        )
+        if distribution_labels.shape != (self.num_distributions,):
+            raise ValueError(
+                "distribution_labels must have shape (num_distributions,)"
+            )
+        if distribution_labels.min() < 0:
+            raise ValueError("distribution_labels must be non-negative")
+        self.distribution_labels = distribution_labels.to(dtype=torch.long)
+        if num_classes is None:
+            num_classes = int(self.distribution_labels.max().item()) + 1
+        if num_classes < 1:
+            raise ValueError("num_classes must be at least 1")
+        if self.distribution_labels.max() >= num_classes:
+            raise ValueError("distribution_labels must be less than num_classes")
+        self.num_classes = int(num_classes)
+
+    @classmethod
+    def from_generator(cls, data_generator):
+        return cls(
+            distributions=data_generator.distributions,
+            distribution_labels=data_generator.distribution_labels,
+            distribution_weights=data_generator.distribution_weights,
+            num_classes=2,
+        )
+
+    @torch.no_grad()
+    def predict_proba(self, input_ids):
+        posterior = self.posterior_over_components(input_ids)
+        labels = self.distribution_labels.unsqueeze(0).expand(posterior.shape[0], -1)
+        probabilities = posterior.new_zeros(posterior.shape[0], self.num_classes)
+        return probabilities.scatter_add(1, labels, posterior)
+
+    @torch.no_grad()
+    def predict(self, input_ids):
+        return self.predict_proba(input_ids).argmax(dim=1)
+
+    @torch.no_grad()
+    def losses(self, tokens, targets):
+        log_proba = self.predict_proba(tokens).clamp_min(self.eps).log()
+        targets = targets.to(device=log_proba.device, dtype=torch.long)
+        return -log_proba.gather(1, targets[:, None]).squeeze(1)
+
+    def to(self, device):
+        super().to(device)
+        self.distribution_labels = self.distribution_labels.to(self.distributions.device)
+        return self
+
+
 class DirichletEmpiricalEstimator:
     """Posterior predictive baseline using only empirical state counts."""
 
