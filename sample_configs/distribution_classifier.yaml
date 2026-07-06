@@ -1,0 +1,46 @@
+experiment_name: distribution_classifier
+seed: 0
+device: auto
+
+run:
+  output_dir: runs
+  run_dir:
+  resume_from:
+
+data:
+  type: dirichlet_zipf_binary
+  num_distributions: 10000
+  num_states: 100
+  alpha: 0.1
+  zipf_exponent: 1.0
+  sequence_length: 32
+  batch_size: 256
+
+model:
+  type: summary_mlp
+  vocab_size: 100
+  sequence_length: 32
+  num_classes: 2
+  embed_dim: 256
+  mlp_ratio: 4
+  mlp_num_layers: 2
+  dropout: 0.0
+
+optimizer:
+  type: adam
+  lr: 0.001
+  betas: [0.9, 0.999]
+  weight_decay: 0.0
+
+training:
+  max_iters: 10000
+  report_interval: 100
+  checkpoint_interval: 1000
+  grad_clip_norm:
+
+evaluation:
+  interval: 100
+  seed: 12345
+  num_distributions: 1000
+  seqs_per_distribution: 64
+  microbatch_size: 4096
