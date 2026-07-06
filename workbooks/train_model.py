@@ -17,7 +17,7 @@ def _():
         sys.path.insert(0, str(repo_root))
 
     from base.data_generator import DirichletZipfSequenceGenerator
-    from base.estimators import DirichletEmpiricalEstimator
+    from base.estimators import BayesOptimalEstimator, DirichletEmpiricalEstimator
     from base.minimal_model import Transformer
     from workbooks.train_model_helpers import (
         make_balanced_eval_tokens,
@@ -26,12 +26,14 @@ def _():
         mean_loss_by_task,
         model_autoregressive_losses,
         plot_memorization_by_task_rank,
+        plot_memorization_fraction_over_time,
         plot_training_loss,
         plot_unmemorized_distribution_by_rank,
         resolve_device,
     )
 
     return (
+        BayesOptimalEstimator,
         DirichletEmpiricalEstimator,
         DirichletZipfSequenceGenerator,
         Transformer,
@@ -41,6 +43,7 @@ def _():
         mean_loss_by_task,
         model_autoregressive_losses,
         plot_memorization_by_task_rank,
+        plot_memorization_fraction_over_time,
         plot_training_loss,
         plot_unmemorized_distribution_by_rank,
         resolve_device,
@@ -85,6 +88,7 @@ def _():
 @app.cell
 def _(
     DirichletEmpiricalEstimator,
+    BayesOptimalEstimator,
     DirichletZipfSequenceGenerator,
     Transformer,
     batch_size,
@@ -165,6 +169,17 @@ def _(
         task_counts=tracked_task_counts,
         num_tasks=eval_max_tasks,
     )
+    _bayes_estimator = BayesOptimalEstimator.from_generator(data_generator)
+    bayes_eval_losses = _bayes_estimator.autoregressive_losses(
+        dirichlet_eval_tokens,
+        component_chunk_size=1024,
+    ).cpu()
+    tracked_task_bayes_loss = mean_loss_by_task(
+        losses=bayes_eval_losses,
+        task_ids=tracked_task_ids_cpu,
+        task_counts=tracked_task_counts,
+        num_tasks=eval_max_tasks,
+    )
 
     presentation_counts = torch.zeros(num_distributions, dtype=torch.long)
     dirichlet_gap_history = []
@@ -217,6 +232,7 @@ def _(
                 num_tasks=eval_max_tasks,
             )
             tracked_task_gap = tracked_task_model_loss - tracked_task_dirichlet_loss
+            tracked_task_bayes_gap = tracked_task_model_loss - tracked_task_bayes_loss
             memorized = tracked_task_gap < memorization_threshold
             tracked_presentations = presentation_counts[:eval_max_tasks].clone()
             newly_memorized = (
@@ -230,6 +246,7 @@ def _(
                 {
                     "iteration": _iteration + 1,
                     "mean_model_minus_dirichlet": tracked_task_gap.mean().item(),
+                    "mean_model_minus_bayes": tracked_task_bayes_gap.mean().item(),
                     "num_memorized_tasks": int(
                         memorized.sum().item()
                     ),
@@ -240,6 +257,9 @@ def _(
                     "memorization_threshold": memorization_threshold,
                 }
             )
+            if memorized.all():
+                print(f"All tracked tasks memorized at iteration {_iteration + 1}.")
+                break
             model.train()
         if should_report:
             print(
@@ -248,20 +268,31 @@ def _(
             )
             if dirichlet_gap_history:
                 print(
-                    "  Dirichlet gap="
-                    f"{dirichlet_gap_history[-1]['mean_model_minus_dirichlet']:.4f}; "
+                    "  Bayes gap="
+                    f"{dirichlet_gap_history[-1]['mean_model_minus_bayes']:.4f}; "
                     "memorized tasks="
                     f"{dirichlet_gap_history[-1]['num_memorized_tasks']}"
                     f"/{eval_max_tasks} "
                     f"(threshold={memorization_threshold:.4f})"
                 )
-    return losses, memorization_presentations, presentation_counts
+    return dirichlet_gap_history, losses, memorization_presentations, presentation_counts
 
 
 @app.cell
 def _(losses, plot_training_loss):
     _fig = plot_training_loss(losses)
     print(f"final loss: {losses[-1]:.4f}")
+    _fig
+    return
+
+
+@app.cell
+def _(dirichlet_gap_history, eval_max_tasks, plot_memorization_fraction_over_time):
+    _fig = plot_memorization_fraction_over_time(
+        history=dirichlet_gap_history,
+        total_tasks=eval_max_tasks,
+        memorized_key="num_tasks_ever_memorized",
+    )
     _fig
     return
 

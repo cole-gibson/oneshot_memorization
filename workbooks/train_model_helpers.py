@@ -107,12 +107,33 @@ def plot_memorization_by_task_rank(memorization_presentations, eval_max_tasks):
     ]
 
     fig, ax = plt.subplots(figsize=(5.5, 5))
-    ax.scatter(task_ranks, presentations, color="#4f7cac", alpha=0.2)
+    ax.scatter(task_ranks, presentations, color="#4f7cac", alpha=0.2, s=5)
     ax.set_xlabel("task rank")
     ax.set_xscale("log")
     ax.set_ylabel("presentations until memorization")
     ax.set_yscale("log")
     ax.set_title("Memorization by task rank")
+    ax.grid(alpha=0.25)
+    fig.tight_layout()
+    return fig
+
+
+def plot_memorization_fraction_over_time(
+    history,
+    total_tasks,
+    memorized_key,
+    title="Memorization fraction over time",
+):
+    iterations = [row["iteration"] for row in history]
+    fractions = [row[memorized_key] / total_tasks for row in history]
+
+    fig, ax = plt.subplots(figsize=(5.5, 4.5))
+    ax.plot(iterations, fractions, color="#4f7cac")
+    ax.set_xlabel("step")
+    ax.set_ylabel("memorized fraction")
+    ax.set_ylim(-0.02, 1.02)
+    ax.set_title(title)
+    ax.set_xscale("log")
     ax.grid(alpha=0.25)
     fig.tight_layout()
     return fig
