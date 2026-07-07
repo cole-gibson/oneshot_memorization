@@ -217,7 +217,15 @@ def make_eval_batch(data_generator, config, eval_generator):
 
 
 @torch.no_grad()
-def evaluate(model, data_generator, config, eval_batch, log_path, iteration):
+def evaluate(
+    model,
+    data_generator,
+    config,
+    eval_batch,
+    presentation_counts,
+    log_path,
+    iteration,
+):
     model.eval()
     tokens = eval_batch["tokens"]
     labels = eval_batch["labels"]
@@ -236,12 +244,19 @@ def evaluate(model, data_generator, config, eval_batch, log_path, iteration):
         mask = ids_cpu == distribution_id
         append_csv(
             log_path,
-            ["iter", "distribution_id", "label", "loss"],
+            [
+                "iter",
+                "distribution_id",
+                "label",
+                "loss",
+                "training_seen_count",
+            ],
             {
                 "iter": iteration,
                 "distribution_id": distribution_id,
                 "label": int(data_generator.distribution_labels[distribution_id].item()),
                 "loss": f"{losses[mask].mean().item():.8f}",
+                "training_seen_count": int(presentation_counts[distribution_id].item()),
             },
         )
     model.train()
@@ -385,7 +400,15 @@ def main():
             iteration % config["evaluation"]["interval"] == 0
             or iteration == start_iter + 1
         ):
-            evaluate(model, data_generator, config, eval_batch, eval_log, iteration)
+            evaluate(
+                model,
+                data_generator,
+                config,
+                eval_batch,
+                presentation_counts,
+                eval_log,
+                iteration,
+            )
         if (
             iteration % config["training"]["checkpoint_interval"] == 0
             or iteration == max_iters

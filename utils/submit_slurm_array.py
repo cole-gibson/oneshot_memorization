@@ -87,7 +87,7 @@ def write_sbatch(path, args, manifest_path, log_dir, num_jobs):
         "",
         "set -euo pipefail",
         f"cd {repo_root}",
-        f"ROW=$(sed -n \"$((SLURM_ARRAY_TASK_ID + 1))p\" {manifest_path})",
+        f"ROW=$(sed -n \"$((SLURM_ARRAY_TASK_ID + 1))p\" {manifest_path} | tr -d '\\r')",
         "CONFIG_PATH=$(printf '%s' \"$ROW\" | cut -f1)",
         "RUN_DIR=$(printf '%s' \"$ROW\" | cut -f2)",
         "",
@@ -129,7 +129,7 @@ def main():
 
     manifest_path = experiment_dir / "manifest.tsv"
     with manifest_path.open("w", newline="", encoding="utf-8") as manifest_file:
-        writer = csv.writer(manifest_file, delimiter="\t")
+        writer = csv.writer(manifest_file, delimiter="\t", lineterminator="\n")
         for index, source_path in enumerate(config_paths):
             config = copy.deepcopy(load_yaml(source_path))
             config["experiment_name"] = experiment_name
