@@ -9,7 +9,7 @@ import yaml
 def parse_args():
     parser = argparse.ArgumentParser(description="Generate YAML configs from a sweep.")
     parser.add_argument("--reference", type=Path, required=True)
-    parser.add_argument("--output-dir", type=Path, required=True, default=Path("/home/cg5763/data/output_oneshot_memorization"))
+    parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument(
         "--set",
         dest="sets",

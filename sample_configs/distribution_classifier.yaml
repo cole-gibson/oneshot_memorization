@@ -3,7 +3,7 @@ seed: 0
 device: auto
 
 run:
-  output_dir: runs
+  output_dir: /home/cg5763/data/output_oneshot_memorization
   run_dir:
   resume_from:
 
@@ -33,7 +33,7 @@ optimizer:
   weight_decay: 0.0
 
 training:
-  max_iters: 10000
+  max_iters: 50000
   report_interval: 100
   checkpoint_interval: 1000
   grad_clip_norm:
