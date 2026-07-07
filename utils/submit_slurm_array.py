@@ -11,7 +11,12 @@ import yaml
 def parse_args():
     parser = argparse.ArgumentParser(description="Submit a Slurm array over YAML configs.")
     parser.add_argument("config_dir", type=Path)
-    parser.add_argument("--output-root", type=Path, default=Path('/home/cg5763/data/output/oneshot_memorization'))
+    parser.add_argument(
+        "--output-root",
+        type=Path,
+        default=None,
+        help="Root for array outputs. Defaults to run.output_dir from the first config.",
+    )
     parser.add_argument("--experiment-name", default=None)
     parser.add_argument("--description", default=None)
     parser.add_argument("--trainer-module", default="base.train_distribution_classifier")
@@ -113,7 +118,8 @@ def main():
 
     first_config = load_yaml(config_paths[0])
     experiment_name, description = metadata(first_config, args)
-    experiment_dir = args.output_root / f"{slug(experiment_name)}-{coolname.generate_slug(2)}"
+    output_root = args.output_root or Path(first_config["run"]["output_dir"])
+    experiment_dir = output_root / f"{slug(experiment_name)}-{coolname.generate_slug(2)}"
     configs_dir = experiment_dir / "configs"
     runs_dir = experiment_dir / "runs"
     log_dir = repo_root / "logs" / "slurm" / experiment_dir.name
