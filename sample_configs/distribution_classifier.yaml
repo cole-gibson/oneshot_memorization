@@ -41,6 +41,6 @@ training:
 evaluation:
   interval: 100
   seed: 12345
-  num_distributions: 1000
+  num_distributions: 10000
   seqs_per_distribution: 64
   microbatch_size: 4096

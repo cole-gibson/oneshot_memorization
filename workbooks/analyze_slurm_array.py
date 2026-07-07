@@ -34,9 +34,9 @@ def _():
 @app.cell
 def _(Path):
     array_output_dir = Path(
-        "/home/cg5763/data/output_oneshot_memorization"
+        "/home/cg5763/data/output_oneshot_memorization/test-green-armadillo"
     )
-    loss_threshold = 0.0
+    loss_threshold = 0.1
     return array_output_dir, loss_threshold
 
 
@@ -102,12 +102,7 @@ def _(MODEL_TYPES, Path, torch, yaml):
         except Exception:
             return count_parameters_from_checkpoint(run_dir)
 
-    return (
-        count_parameters,
-        flatten_config,
-        load_yaml,
-        parameter_setting,
-    )
+    return count_parameters, flatten_config, load_yaml, parameter_setting
 
 
 @app.cell
@@ -276,6 +271,13 @@ def _(array_output_dir, load_array_runs):
 
 
 @app.cell
+def _(eval_df, loss_threshold, sns):
+    ax = sns.lineplot(data=eval_df[eval_df['distribution_id'] < 50], x='iteration', y='eval_loss', hue='distribution_id', legend=False, alpha=0.5)
+    ax.axhline(loss_threshold, color='red', linestyle='--', label=f'Threshold = {loss_threshold}')
+    return
+
+
+@app.cell
 def _(eval_df, first_below_threshold, loss_threshold, run_df):
     threshold_df = first_below_threshold(eval_df, loss_threshold)
     threshold_df = threshold_df.merge(
@@ -294,23 +296,29 @@ def _(eval_df, first_below_threshold, loss_threshold, run_df):
 
 
 @app.cell
+def _(threshold_df):
+    threshold_df.dropna(subset=["min_training_seen_count"])['distribution_rank'].max()
+    return
+
+
+@app.cell
 def _(plt, sns, threshold_df):
-    fig, ax = plt.subplots(figsize=(9, 5))
-    plot_df = threshold_df.dropna(subset=["min_training_seen_count"])
-    sns.lineplot(
-        data=plot_df,
+    _fig, _ax = plt.subplots(figsize=(9, 5))
+    _plot_df = threshold_df.dropna(subset=["min_training_seen_count"])
+    sns.scatterplot(
+        data=_plot_df,
         x="distribution_rank",
         y="min_training_seen_count",
         hue="parameter_setting",
         marker="o",
-        ax=ax,
+        ax=_ax,
     )
-    ax.set_xscale("log")
-    ax.set_yscale("log")
-    ax.set_xlabel("Distribution rank")
-    ax.set_ylabel("Minimum training appearances")
-    ax.set_title("Appearances needed to cross loss threshold")
-    fig
+    _ax.set_xscale("log")
+    _ax.set_yscale("log")
+    _ax.set_xlabel("Distribution rank")
+    _ax.set_ylabel("Minimum training appearances")
+    _ax.set_title("Appearances needed to cross loss threshold")
+    _fig
     return
 
 
@@ -323,37 +331,38 @@ def _(eval_df, final_run_metrics, loss_threshold, run_df):
 
 @app.cell
 def _(plt, sns, summary_df):
-    fig, ax = plt.subplots(figsize=(7, 5))
+    _fig, _ax = plt.subplots(figsize=(7, 5))
     sns.scatterplot(
         data=summary_df,
         x="num_parameters",
         y="final_loss",
         hue="parameter_setting",
-        ax=ax,
+        ax=_ax,
     )
-    ax.set_xscale("log")
-    ax.set_xlabel("Number of parameters")
-    ax.set_ylabel("Final loss")
-    ax.set_title("Final loss by model size")
-    fig
+    _ax.set_xscale("log")
+    _ax.set_xlabel("Number of parameters")
+    _ax.set_yscale("log")
+    _ax.set_ylabel("Final loss")
+    _ax.set_title("Final loss by model size")
+    _fig
     return
 
 
 @app.cell
 def _(plt, sns, summary_df):
-    fig, ax = plt.subplots(figsize=(7, 5))
+    _fig, _ax = plt.subplots(figsize=(7, 5))
     sns.scatterplot(
         data=summary_df,
         x="num_parameters",
         y="max_memorized_distribution_rank",
         hue="parameter_setting",
-        ax=ax,
+        ax=_ax,
     )
-    ax.set_xscale("log")
-    ax.set_xlabel("Number of parameters")
-    ax.set_ylabel("Maximum memorized distribution rank")
-    ax.set_title("Memorized rank by model size")
-    fig
+    _ax.set_xscale("log")
+    _ax.set_xlabel("Number of parameters")
+    _ax.set_ylabel("Maximum memorized distribution rank")
+    _ax.set_title("Memorized rank by model size")
+    _fig
     return
 
 
