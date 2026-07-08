@@ -1,4 +1,5 @@
 import argparse
+import contextlib
 import csv
 import random
 import time
@@ -87,6 +88,11 @@ def validate_config(config):
         raise ValueError("evaluation.interval must be at least 1")
     if evaluation["seqs_per_distribution"] < 1:
         raise ValueError("evaluation.seqs_per_distribution must be at least 1")
+    if training.get("log_interval", 1) < 1:
+        raise ValueError("training.log_interval must be at least 1")
+    amp_dtype = training.get("amp_dtype")
+    if amp_dtype not in (None, "bf16", "fp16"):
+        raise ValueError("training.amp_dtype must be one of null, 'bf16', or 'fp16'")
 
 
 def build_data_generator(config, device, generator, checkpoint=None):
@@ -110,16 +116,55 @@ def build_model(config):
     return MODEL_TYPES[model_type](**model)
 
 
-def build_optimizer(model, config):
+def build_optimizer(model, config, device):
     opt = config["optimizer"]
     if opt.get("type", "adam") != "adam":
         raise ValueError("optimizer.type must be 'adam'")
-    return torch.optim.Adam(
-        model.parameters(),
-        lr=opt["lr"],
-        betas=tuple(opt.get("betas", [0.9, 0.999])),
-        weight_decay=opt.get("weight_decay", 0.0),
-    )
+    optimizer_kwargs = {
+        "lr": opt["lr"],
+        "betas": tuple(opt.get("betas", [0.9, 0.999])),
+        "weight_decay": opt.get("weight_decay", 0.0),
+    }
+    if opt.get("fused", False):
+        if device.type != "cuda":
+            raise ValueError("optimizer.fused requires a CUDA device")
+        optimizer_kwargs["fused"] = True
+    try:
+        return torch.optim.Adam(model.parameters(), **optimizer_kwargs)
+    except TypeError as error:
+        if optimizer_kwargs.get("fused"):
+            raise ValueError(
+                "optimizer.fused is not supported by this PyTorch build"
+            ) from error
+        raise
+
+
+def resolve_amp_dtype(config, device):
+    amp_dtype = config["training"].get("amp_dtype")
+    if amp_dtype is None:
+        return None
+    if device.type != "cuda":
+        raise ValueError("training.amp_dtype requires a CUDA device")
+    return {"bf16": torch.bfloat16, "fp16": torch.float16}[amp_dtype]
+
+
+def make_grad_scaler(config, device):
+    enabled = device.type == "cuda" and config["training"].get("amp_dtype") == "fp16"
+    return torch.amp.GradScaler("cuda", enabled=enabled)
+
+
+def autocast_kwargs(device, amp_dtype):
+    return {
+        "device_type": device.type,
+        "dtype": amp_dtype,
+        "enabled": amp_dtype is not None,
+    }
+
+
+def autocast_context(device, amp_dtype):
+    if amp_dtype is None:
+        return contextlib.nullcontext()
+    return torch.amp.autocast(**autocast_kwargs(device, amp_dtype))
 
 
 def rng_state(train_generator, eval_generator):
@@ -191,6 +236,15 @@ def append_csv(path, fieldnames, row):
         writer.writerow(row)
 
 
+def append_csv_rows(path, fieldnames, rows):
+    exists = path.exists()
+    with path.open("a", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if not exists:
+            writer.writeheader()
+        writer.writerows(rows)
+
+
 def make_eval_batch(data_generator, config, eval_generator):
     num_distributions = min(
         config["evaluation"].get(
@@ -225,6 +279,7 @@ def evaluate(
     presentation_counts,
     log_path,
     iteration,
+    amp_dtype,
 ):
     model.eval()
     tokens = eval_batch["tokens"]
@@ -234,31 +289,38 @@ def evaluate(
     microbatch = config["evaluation"].get("microbatch_size", ids.numel())
     for start in range(0, ids.numel(), microbatch):
         stop = min(start + microbatch, ids.numel())
-        logits = model(tokens[start:stop])["logits"]
-        losses.append(F.cross_entropy(logits, labels[start:stop], reduction="none").cpu())
+        with autocast_context(tokens.device, amp_dtype):
+            logits = model(tokens[start:stop])["logits"]
+            losses.append(
+                F.cross_entropy(logits, labels[start:stop], reduction="none")
+            )
     losses = torch.cat(losses)
-    ids_cpu = ids.cpu()
-    num_distributions = int(ids_cpu.max().item()) + 1
+    num_distributions = int(ids.max().item()) + 1
+    loss_sums = torch.zeros(num_distributions, device=losses.device, dtype=losses.dtype)
+    loss_sums.scatter_add_(0, ids, losses)
+    loss_counts = torch.bincount(ids, minlength=num_distributions).clamp_min(1)
+    mean_losses = (loss_sums / loss_counts.to(losses.dtype)).cpu()
+    labels_cpu = data_generator.distribution_labels[:num_distributions].cpu()
+    counts_cpu = presentation_counts[:num_distributions].cpu()
 
-    for distribution_id in range(num_distributions):
-        mask = ids_cpu == distribution_id
-        append_csv(
-            log_path,
-            [
-                "iter",
-                "distribution_id",
-                "label",
-                "loss",
-                "training_seen_count",
-            ],
-            {
-                "iter": iteration,
-                "distribution_id": distribution_id,
-                "label": int(data_generator.distribution_labels[distribution_id].item()),
-                "loss": f"{losses[mask].mean().item():.8f}",
-                "training_seen_count": int(presentation_counts[distribution_id].item()),
-            },
-        )
+    fieldnames = [
+        "iter",
+        "distribution_id",
+        "label",
+        "loss",
+        "training_seen_count",
+    ]
+    rows = [
+        {
+            "iter": iteration,
+            "distribution_id": distribution_id,
+            "label": int(labels_cpu[distribution_id].item()),
+            "loss": f"{mean_losses[distribution_id].item():.8f}",
+            "training_seen_count": int(counts_cpu[distribution_id].item()),
+        }
+        for distribution_id in range(num_distributions)
+    ]
+    append_csv_rows(log_path, fieldnames, rows)
     model.train()
 
 
@@ -317,21 +379,31 @@ def main():
 
     data_generator = build_data_generator(config, device, train_generator, checkpoint)
     model = build_model(config).to(device)
-    optimizer = build_optimizer(model, config)
+    optimizer = build_optimizer(model, config, device)
+    amp_dtype = resolve_amp_dtype(config, device)
+    grad_scaler = make_grad_scaler(config, device)
     presentation_counts = torch.zeros(
         config["data"]["num_distributions"],
         dtype=torch.long,
+        device=device,
     )
     start_iter = 0
     if checkpoint is not None:
         model.load_state_dict(checkpoint["model_state"])
         optimizer.load_state_dict(checkpoint["optimizer_state"])
         start_iter = int(checkpoint["iteration"])
-        presentation_counts = checkpoint["presentation_counts"].to(dtype=torch.long)
+        presentation_counts = checkpoint["presentation_counts"].to(
+            device=device,
+            dtype=torch.long,
+        )
         set_rng_state(checkpoint.get("rng_state"), train_generator, None)
         eval_batch = move_eval_batch(checkpoint["eval_batch"], device)
     else:
         eval_batch = make_eval_batch(data_generator, config, eval_generator)
+
+    forward_model = model
+    if config["training"].get("compile", False):
+        forward_model = torch.compile(model)
 
     train_log = run_dir / "train_log.csv"
     eval_log = run_dir / "eval_by_distribution.csv"
@@ -343,6 +415,7 @@ def main():
         "report_interval",
         config["evaluation"]["interval"],
     )
+    log_interval = config["training"].get("log_interval", report_interval)
     model.train()
     for iteration in range(start_iter + 1, max_iters + 1):
         tokens, distribution_ids, labels = data_generator.sample(
@@ -352,35 +425,53 @@ def main():
             return_labels=True,
         )
         presentation_counts += torch.bincount(
-            distribution_ids.cpu(),
+            distribution_ids,
             minlength=config["data"]["num_distributions"],
         )
 
         optimizer.zero_grad(set_to_none=True)
-        loss = model(tokens, targets=labels)["loss"]
-        loss.backward()
+        with autocast_context(device, amp_dtype):
+            loss = forward_model(tokens, targets=labels)["loss"]
+        grad_scaler.scale(loss).backward()
         if config["training"].get("grad_clip_norm") is not None:
+            grad_scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(
                 model.parameters(),
                 float(config["training"]["grad_clip_norm"]),
             )
-        optimizer.step()
+        grad_scaler.step(optimizer)
+        grad_scaler.update()
 
-        append_csv(
-            train_log,
-            ["iter", "loss", "lr", "time_sec"],
-            {
-                "iter": iteration,
-                "loss": f"{loss.item():.8f}",
-                "lr": optimizer.param_groups[0]["lr"],
-                "time_sec": f"{time.perf_counter() - start_time:.4f}",
-            },
-        )
-        if (
+        should_report = (
             iteration == start_iter + 1
             or iteration % report_interval == 0
             or iteration == max_iters
-        ):
+        )
+        should_log_train = (
+            iteration == start_iter + 1
+            or iteration % log_interval == 0
+            or iteration == max_iters
+        )
+        should_checkpoint = (
+            iteration % config["training"]["checkpoint_interval"] == 0
+            or iteration == max_iters
+        )
+        loss_value = None
+        if should_log_train or should_report or should_checkpoint:
+            loss_value = loss.item()
+
+        if should_log_train:
+            append_csv(
+                train_log,
+                ["iter", "loss", "lr", "time_sec"],
+                {
+                    "iter": iteration,
+                    "loss": f"{loss_value:.8f}",
+                    "lr": optimizer.param_groups[0]["lr"],
+                    "time_sec": f"{time.perf_counter() - start_time:.4f}",
+                },
+            )
+        if should_report:
             now = time.perf_counter()
             recent_iters = iteration - last_report_iter
             recent_sec_per_iter = (now - last_report_time) / recent_iters
@@ -388,7 +479,7 @@ def main():
             eta = format_duration((max_iters - iteration) * total_sec_per_iter)
             print(
                 f"iter {iteration}/{max_iters} "
-                f"loss {loss.item():.6f} "
+                f"loss {loss_value:.6f} "
                 f"sec_per_iter {recent_sec_per_iter:.4f} "
                 f"avg_sec_per_iter {total_sec_per_iter:.4f} "
                 f"eta {eta}",
@@ -401,18 +492,16 @@ def main():
             or iteration == start_iter + 1
         ):
             evaluate(
-                model,
+                forward_model,
                 data_generator,
                 config,
                 eval_batch,
                 presentation_counts,
                 eval_log,
                 iteration,
+                amp_dtype,
             )
-        if (
-            iteration % config["training"]["checkpoint_interval"] == 0
-            or iteration == max_iters
-        ):
+        if should_checkpoint:
             for path in (
                 checkpoint_dir / f"checkpoint_{iteration:06d}.pt",
                 checkpoint_dir / "latest.pt",
@@ -429,7 +518,7 @@ def main():
                     train_generator,
                     eval_batch,
                 )
-            print(f"checkpoint iter {iteration} loss {loss.item():.6f}", flush=True)
+            print(f"checkpoint iter {iteration} loss {loss_value:.6f}", flush=True)
 
     print(f"run directory: {run_dir}")
 
