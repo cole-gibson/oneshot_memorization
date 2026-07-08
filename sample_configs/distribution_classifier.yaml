@@ -10,7 +10,7 @@ run:
 data:
   type: dirichlet_zipf_binary
   num_distributions: 10000
-  num_states: 100
+  num_states: 1000
   alpha: 0.1
   zipf_exponent: 1.0
   sequence_length: 32
@@ -18,7 +18,7 @@ data:
 
 model:
   type: summary_mlp
-  vocab_size: 100
+  vocab_size: 1000
   sequence_length: 32
   num_classes: 2
   embed_dim: 256
@@ -33,14 +33,14 @@ optimizer:
   weight_decay: 0.0
 
 training:
-  max_iters: 50000
-  report_interval: 100
-  checkpoint_interval: 1000
+  max_iters: 500000
+  report_interval: 10000
+  checkpoint_interval: 50000
   grad_clip_norm:
 
 evaluation:
-  interval: 100
+  interval: 500
   seed: 12345
   num_distributions: 10000
   seqs_per_distribution: 64
-  microbatch_size: 4096
+  microbatch_size: 10000

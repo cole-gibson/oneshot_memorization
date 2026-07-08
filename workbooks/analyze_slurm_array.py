@@ -34,7 +34,7 @@ def _():
 @app.cell
 def _(Path):
     array_output_dir = Path(
-        "/home/cg5763/data/output_oneshot_memorization/test-green-armadillo"
+        "/home/cg5763/data/output_oneshot_memorization/scaling-striped-gaur"
     )
     loss_threshold = 0.1
     return array_output_dir, loss_threshold
@@ -152,6 +152,7 @@ def _(
             eval_path = run_dir / "eval_by_distribution.csv"
             eval_df = load_eval_csv(eval_path)
             run_id = run_dir.name
+            eval_df['rolling_eval_loss'] = eval_df.groupby('distribution_id')['eval_loss'].transform(lambda x: x.rolling(window=10, min_periods=1).mean())
             eval_df["run_id"] = run_id
             eval_df["run_dir"] = str(run_dir)
             eval_df["eval_path"] = str(eval_path)
@@ -206,16 +207,47 @@ def _(pd):
                     "distribution_id",
                     "distribution_rank",
                     "min_training_seen_count",
+                    "previous_training_seen_count",
                 ]
             )
         if "training_seen_count" not in eval_df.columns:
             raise ValueError("eval data must include training_seen_count")
-        hits = eval_df[eval_df["eval_loss"] < threshold]
-        first_hits = (
-            hits.groupby(["run_id", "distribution_id"], as_index=False)
-            ["training_seen_count"]
-            .min()
-            .rename(columns={"training_seen_count": "min_training_seen_count"})
+        first_hit_rows = []
+        for (run_id, distribution_id), group in eval_df.groupby(
+            ["run_id", "distribution_id"]
+        ):
+            group = group.sort_values("iteration")
+            hit_positions = (
+                (group["rolling_eval_loss"] < threshold).to_numpy().nonzero()[0]
+            )
+            if len(hit_positions) == 0:
+                continue
+
+            hit_position = hit_positions[0]
+            hit_row = group.iloc[hit_position]
+            previous_training_seen_count = pd.NA
+            if hit_position > 0:
+                previous_training_seen_count = group.iloc[hit_position - 1][
+                    "training_seen_count"
+                ]
+
+            first_hit_rows.append(
+                {
+                    "run_id": run_id,
+                    "distribution_id": distribution_id,
+                    "min_training_seen_count": hit_row["training_seen_count"],
+                    "previous_training_seen_count": previous_training_seen_count,
+                }
+            )
+
+        first_hits = pd.DataFrame(
+            first_hit_rows,
+            columns=[
+                "run_id",
+                "distribution_id",
+                "min_training_seen_count",
+                "previous_training_seen_count",
+            ],
         )
         distributions = eval_df[
             ["run_id", "distribution_id", "distribution_rank"]
@@ -247,7 +279,7 @@ def _(pd):
             .mean()
             .rename(columns={"eval_loss": "final_loss"})
         )
-        memorized = final_eval[final_eval["eval_loss"] < threshold]
+        memorized = final_eval[final_eval["rolling_eval_loss"] < threshold]
         max_rank = (
             memorized.groupby("run_id", as_index=False)["distribution_rank"]
             .max()
@@ -271,9 +303,8 @@ def _(array_output_dir, load_array_runs):
 
 
 @app.cell
-def _(eval_df, loss_threshold, sns):
-    ax = sns.lineplot(data=eval_df[eval_df['distribution_id'] < 50], x='iteration', y='eval_loss', hue='distribution_id', legend=False, alpha=0.5)
-    ax.axhline(loss_threshold, color='red', linestyle='--', label=f'Threshold = {loss_threshold}')
+def _(eval_df, sns):
+    sns.lineplot(data=eval_df[eval_df['run_id'].eq('0000_0000-model-embed-dim-256') & eval_df['distribution_id'].isin([8000, 8001])], x='iteration', y='rolling_eval_loss', hue='distribution_id')
     return
 
 
@@ -302,9 +333,53 @@ def _(threshold_df):
 
 
 @app.cell
-def _(plt, sns, threshold_df):
+def _(pd, plt, sns, threshold_df):
+    _plot_df = threshold_df.dropna(subset=["min_training_seen_count"]).copy()
+    _plot_df["min_training_seen_count"] = pd.to_numeric(
+        _plot_df["min_training_seen_count"]
+    )
+    _plot_df = _plot_df[_plot_df["min_training_seen_count"] > 0]
+    if _plot_df.empty:
+        _fig, _ax = plt.subplots(figsize=(7, 4))
+        _ax.text(
+            0.5,
+            0.5,
+            "No memorized distributions",
+            ha="center",
+            va="center",
+            transform=_ax.transAxes,
+        )
+        _ax.set_axis_off()
+    else:
+        _grid = sns.displot(
+            data=_plot_df,
+            x="min_training_seen_count",
+            col="parameter_setting",
+            col_wrap=2,
+            bins=30,
+            height=3.2,
+            aspect=1.3,
+            facet_kws={"sharey": False},
+        )
+        _grid.set(
+            xscale="log",
+            xlabel="Training appearances at memorization",
+            ylabel="Distributions",
+        )
+        _grid.set_titles("{col_name}")
+        _grid.fig.suptitle(
+            "Memorization time distribution by parameter setting",
+            y=1.02,
+        )
+        _fig = _grid.fig
+    _fig
+    return
+
+
+@app.cell
+def _(pd, plt, sns, threshold_df):
     _fig, _ax = plt.subplots(figsize=(9, 5))
-    _plot_df = threshold_df.dropna(subset=["min_training_seen_count"])
+    _plot_df = threshold_df.dropna(subset=["min_training_seen_count"]).copy()
     sns.scatterplot(
         data=_plot_df,
         x="distribution_rank",
@@ -312,6 +387,27 @@ def _(plt, sns, threshold_df):
         hue="parameter_setting",
         marker="o",
         ax=_ax,
+    )
+    _previous_counts = _plot_df["previous_training_seen_count"].fillna(
+        _plot_df["min_training_seen_count"]
+    )
+    _previous_counts = pd.to_numeric(_previous_counts)
+    _min_counts = pd.to_numeric(_plot_df["min_training_seen_count"])
+    _lower_error = (
+        _min_counts - _previous_counts
+    ).clip(lower=0)
+    _ax.errorbar(
+        _plot_df["distribution_rank"],
+        _min_counts,
+        yerr=[_lower_error, _lower_error * 0],
+        fmt="none",
+        ecolor="0.35",
+        # elinewidth=0.8,
+        # capsize=2,
+        elinewidth=0.,
+        capsize=0,
+        alpha=0.6,
+        zorder=1.5,
     )
     _ax.set_xscale("log")
     _ax.set_yscale("log")
