@@ -20,14 +20,11 @@ def _():
         classification_losses,
         make_memorization_rows,
         make_torch_generator,
-        num_classes_for_label_scheme,
         plot_memorization_by_task_rank,
         plot_memorization_fraction_over_time,
         plot_training_loss,
         plot_unmemorized_distribution_by_rank,
         resolve_device,
-        sequence_baseline_accuracy,
-        targets_for_sequence_labels,
     )
 
     return (
@@ -36,21 +33,18 @@ def _():
         classification_losses,
         make_memorization_rows,
         make_torch_generator,
-        num_classes_for_label_scheme,
         plot_memorization_by_task_rank,
         plot_memorization_fraction_over_time,
         plot_training_loss,
         plot_unmemorized_distribution_by_rank,
         resolve_device,
-        sequence_baseline_accuracy,
-        targets_for_sequence_labels,
         torch,
     )
 
 
 @app.cell
 def _():
-    num_sequences = 10_000
+    num_sequences = 20_000
     sequence_length = 100
     zipf_exponent = 1.0
     batch_size = 256
@@ -58,18 +52,18 @@ def _():
     learning_rate = 1e-3
     seed = 0
     device_name = "auto"
-    eval_max_sequences = min(num_sequences, 5000)
-    eval_microbatch_size = 4096
-    eval_interval = 1
-    label_scheme = "identity"
-    memorization_margin = 9
+    eval_max_sequences = min(num_sequences, 20_000)
+    eval_microbatch_size = 50_000
+    eval_interval = 1_000
+    embed_dim = 128
+    memorization_margin = 0.001
     return (
         batch_size,
         device_name,
+        embed_dim,
         eval_interval,
         eval_max_sequences,
         eval_microbatch_size,
-        label_scheme,
         learning_rate,
         max_iters,
         memorization_margin,
@@ -87,21 +81,18 @@ def _(
     batch_size,
     classification_losses,
     device_name,
+    embed_dim,
     eval_interval,
     eval_max_sequences,
     eval_microbatch_size,
-    label_scheme,
     learning_rate,
     make_torch_generator,
     max_iters,
     memorization_margin,
-    num_classes_for_label_scheme,
     num_sequences,
     resolve_device,
     seed,
-    sequence_baseline_accuracy,
     sequence_length,
-    targets_for_sequence_labels,
     torch,
     zipf_exponent,
 ):
@@ -117,12 +108,12 @@ def _(
         device=device,
         generator=rng,
     )
-    num_classes = num_classes_for_label_scheme(label_scheme, num_sequences)
+    num_classes = 2
 
     model = SequenceClassifierMLP(
         sequence_length=sequence_length,
         num_classes=num_classes,
-        hidden_dim=128,
+        embed_dim=embed_dim,
         num_hidden_layers=2,
         dropout=0.0,
     ).to(device)
@@ -134,23 +125,13 @@ def _(
 
     tracked_sequence_ids = torch.arange(eval_max_sequences, device=device)
     eval_tokens = data_generator.sample_from_sequence_ids(tracked_sequence_ids)
-    eval_targets = targets_for_sequence_labels(
-        data_generator,
-        tracked_sequence_ids,
-        label_scheme,
-    )
-    bayes_accuracy = sequence_baseline_accuracy(
-        data_generator,
-        eval_tokens,
-        eval_targets,
-        label_scheme,
-    )
-    chance_loss = torch.log(torch.tensor(float(num_classes))).item()
+    eval_targets = data_generator.labels[tracked_sequence_ids]
+    bayes_accuracy = 1.0
     bayes_loss = 0.0
 
     print("Bayes optimal classification accuracy:", f"{bayes_accuracy:.4f}")
     print("Bayes optimal loss:", f"{bayes_loss:.4f}")
-    print("chance loss:", f"{chance_loss:.4f}")
+    print("memorization loss threshold:", f"{memorization_margin:.4f}")
 
     presentation_counts = torch.zeros(num_sequences, dtype=torch.long)
     memorization_presentations = torch.full(
@@ -167,11 +148,7 @@ def _(
             batch_size=batch_size,
             return_sequence_ids=True,
         )
-        labels = targets_for_sequence_labels(
-            data_generator,
-            sequence_ids,
-            label_scheme,
-        )
+        labels = data_generator.labels[sequence_ids]
         presentation_counts += torch.bincount(
             sequence_ids.cpu(),
             minlength=num_sequences,
@@ -199,8 +176,7 @@ def _(
                 eval_targets,
                 microbatch_size=eval_microbatch_size,
             )
-            improvements = chance_loss - eval_losses
-            memorized = improvements >= memorization_margin
+            memorized = eval_losses <= memorization_margin
             tracked_presentations = presentation_counts[:eval_max_sequences].clone()
             newly_memorized = (memorization_presentations < 0) & memorized
             memorization_presentations[newly_memorized] = (
@@ -211,7 +187,6 @@ def _(
                     "iteration": _iteration + 1,
                     "mean_loss": eval_losses.mean().item(),
                     "mean_model_minus_bayes": eval_losses.mean().item() - bayes_loss,
-                    "mean_improvement_over_chance": improvements.mean().item(),
                     "num_memorized_sequences": int(memorized.sum().item()),
                     "num_sequences_ever_memorized": int(
                         (memorization_presentations >= 0).sum().item()
@@ -236,7 +211,7 @@ def _(
                     "memorized sequences="
                     f"{margin_history[-1]['num_memorized_sequences']}"
                     f"/{eval_max_sequences} "
-                    f"(margin={memorization_margin:.4f})"
+                    f"(loss threshold={memorization_margin:.4f})"
                 )
     return (
         losses,
