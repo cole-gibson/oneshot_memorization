@@ -32,7 +32,7 @@ def _(Path):
     array_output_dir = Path(
         "/home/cg5763/data/output_oneshot_memorization/scaling-striped-gaur"
     )
-    loss_threshold = 0.1
+    loss_threshold = 0.01
     return array_output_dir, loss_threshold
 
 
