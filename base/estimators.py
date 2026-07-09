@@ -36,19 +36,8 @@ def counts_from_tokens(input_ids, num_states):
     )
 
 
-def make_alpha(alpha, num_states, device, dtype):
-    alpha = torch.as_tensor(alpha, device=device, dtype=dtype)
-    if torch.any(alpha <= 0):
-        raise ValueError("alpha must be positive")
-    if alpha.ndim == 0:
-        return alpha.expand(num_states)
-    if alpha.shape != (num_states,):
-        raise ValueError("alpha must be a scalar or a tensor with shape (num_states,)")
-    return alpha
-
-
-class BayesOptimalEstimator:
-    """Bayes optimal next-state predictor for the finite mixture generator."""
+class DistributionPosterior:
+    """Posterior over Dirichlet-Zipf mixture components."""
 
     def __init__(
         self,
@@ -136,90 +125,6 @@ class BayesOptimalEstimator:
         log_posterior = log_posterior + self.log_prior
         return torch.softmax(log_posterior, dim=-1)
 
-    @torch.no_grad()
-    def predict_proba(self, input_ids):
-        posterior = self.posterior_over_components(input_ids)
-        return posterior @ self.distributions
-
-    @torch.no_grad()
-    def predict_log_proba(self, input_ids):
-        return self.predict_proba(input_ids).clamp_min(self.eps).log()
-
-    @torch.no_grad()
-    def autoregressive_losses(self, tokens, component_chunk_size=None):
-        tokens = as_2d_tokens(tokens).to(self.distributions.device)
-        if tokens.shape[1] < 2:
-            raise ValueError("tokens must contain at least two positions")
-
-        input_ids = tokens[:, :-1]
-        targets = tokens[:, 1:]
-        batch_size, input_len = input_ids.shape
-        if component_chunk_size is None:
-            component_chunk_size = self.num_distributions
-        component_chunk_size = int(component_chunk_size)
-        if component_chunk_size < 1:
-            raise ValueError("component_chunk_size must be at least 1")
-
-        counts = torch.zeros(
-            batch_size,
-            self.num_states,
-            device=self.distributions.device,
-            dtype=self.distributions.dtype,
-        )
-        losses = []
-
-        for pos in range(input_len):
-            counts.scatter_add_(
-                dim=1,
-                index=input_ids[:, pos : pos + 1],
-                src=counts.new_ones(batch_size, 1),
-            )
-            target = targets[:, pos]
-            log_denominator = torch.full(
-                (batch_size,),
-                float("-inf"),
-                device=self.distributions.device,
-                dtype=self.distributions.dtype,
-            )
-            log_numerator = torch.full_like(log_denominator, float("-inf"))
-
-            for chunk_start in range(
-                0,
-                self.num_distributions,
-                component_chunk_size,
-            ):
-                chunk_stop = min(
-                    self.num_distributions,
-                    chunk_start + component_chunk_size,
-                )
-                log_distributions = self.log_distributions[chunk_start:chunk_stop]
-                component_scores = (
-                    counts @ log_distributions.T
-                    + self.log_prior[chunk_start:chunk_stop]
-                )
-                target_log_probs = log_distributions.T[target]
-                log_denominator = torch.logaddexp(
-                    log_denominator,
-                    torch.logsumexp(component_scores, dim=1),
-                )
-                log_numerator = torch.logaddexp(
-                    log_numerator,
-                    torch.logsumexp(component_scores + target_log_probs, dim=1),
-                )
-
-            losses.append(-(log_numerator - log_denominator))
-
-        return torch.stack(losses, dim=1).mean(dim=1)
-
-    @torch.no_grad()
-    def autoregressive_loss(self, tokens, component_chunk_size=None):
-        return self.autoregressive_losses(
-            tokens,
-            component_chunk_size=component_chunk_size,
-        ).mean()
-
-    __call__ = predict_proba
-
     def to(self, device):
         device = torch.device(device)
         self.distributions = self.distributions.to(device)
@@ -229,7 +134,7 @@ class BayesOptimalEstimator:
         return self
 
 
-class BayesOptimalDistributionLabelClassifier(BayesOptimalEstimator):
+class BayesOptimalDistributionLabelClassifier(DistributionPosterior):
     """Bayes optimal classifier for labels attached to components."""
 
     def __init__(
@@ -297,73 +202,4 @@ class BayesOptimalDistributionLabelClassifier(BayesOptimalEstimator):
     def to(self, device):
         super().to(device)
         self.distribution_labels = self.distribution_labels.to(self.distributions.device)
-        return self
-
-
-class DirichletEmpiricalEstimator:
-    """Posterior predictive baseline using only empirical state counts."""
-
-    def __init__(self, num_states, alpha, device=None, dtype=torch.float32):
-        if num_states < 1:
-            raise ValueError("num_states must be at least 1")
-        self.num_states = num_states
-        self.device = torch.device(device) if device is not None else torch.device("cpu")
-        self.dtype = dtype
-        self.alpha = make_alpha(alpha, num_states, self.device, dtype)
-
-    @torch.no_grad()
-    def predict_proba(self, input_ids):
-        counts = counts_from_tokens(
-            as_2d_tokens(input_ids).to(self.device),
-            self.num_states,
-        ).to(dtype=self.dtype)
-        posterior_counts = counts + self.alpha
-        return posterior_counts / posterior_counts.sum(dim=-1, keepdim=True)
-
-    @torch.no_grad()
-    def predict_log_proba(self, input_ids):
-        return self.predict_proba(input_ids).log()
-
-    @torch.no_grad()
-    def autoregressive_losses(self, tokens, eps=1e-30):
-        tokens = as_2d_tokens(tokens).to(self.device)
-        if tokens.shape[1] < 2:
-            raise ValueError("tokens must contain at least two positions")
-
-        input_ids = tokens[:, :-1]
-        targets = tokens[:, 1:]
-        batch_size, input_len = input_ids.shape
-        counts = torch.zeros(
-            batch_size,
-            self.num_states,
-            device=self.device,
-            dtype=self.dtype,
-        )
-        alpha = self.alpha.unsqueeze(0)
-        alpha_sum = self.alpha.sum()
-        losses = []
-
-        for pos in range(input_len):
-            counts.scatter_add_(
-                dim=1,
-                index=input_ids[:, pos : pos + 1],
-                src=counts.new_ones(batch_size, 1),
-            )
-            target_counts = (counts + alpha).gather(1, targets[:, pos : pos + 1])
-            denominator = alpha_sum + float(pos + 1)
-            losses.append(
-                -target_counts.div(denominator).clamp_min(eps).log().squeeze(1)
-            )
-
-        return torch.stack(losses, dim=1).mean(dim=1)
-
-    @torch.no_grad()
-    def autoregressive_loss(self, tokens, eps=1e-30):
-        return self.autoregressive_losses(tokens, eps=eps).mean()
-
-    __call__ = predict_proba
-
-    def to(self, device):
-        self.device = torch.device(device)
-        self.alpha = self.alpha.to(self.device)
         return self

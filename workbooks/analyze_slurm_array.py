@@ -20,12 +20,8 @@ def _():
         sys.path.insert(0, str(repo_root))
 
     from base.bit_sequences import SummarySequenceClassifierMLP
-    from base.minimal_model import Transformer as MinimalTransformer
-    from base.model import Transformer as FullTransformer
 
     MODEL_TYPES = {
-        "full": FullTransformer,
-        "minimal": MinimalTransformer,
         "summary_mlp": SummarySequenceClassifierMLP,
     }
     return MODEL_TYPES, Path, pd, plt, sns, torch, yaml

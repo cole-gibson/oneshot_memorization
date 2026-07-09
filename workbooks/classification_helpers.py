@@ -2,6 +2,9 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
 
+from base.bit_sequences import BayesOptimalSequenceClassifier
+from base.estimators import BayesOptimalDistributionLabelClassifier
+
 
 def resolve_device(device_name):
     if device_name == "auto":
@@ -15,49 +18,94 @@ def make_torch_generator(device, seed):
     return torch.Generator(device=device).manual_seed(seed)
 
 
+def num_classes_for_label_scheme(label_scheme, num_tasks):
+    if label_scheme == "binary":
+        return 2
+    if label_scheme == "identity":
+        return num_tasks
+    raise ValueError("label_scheme must be 'binary' or 'identity'")
+
+
+def targets_for_sequence_labels(data_generator, sequence_ids, label_scheme):
+    if label_scheme == "binary":
+        return data_generator.labels[sequence_ids]
+    if label_scheme == "identity":
+        return sequence_ids
+    raise ValueError("label_scheme must be 'binary' or 'identity'")
+
+
+def targets_for_distribution_labels(data_generator, distribution_ids, label_scheme):
+    if label_scheme == "binary":
+        return data_generator.distribution_labels[distribution_ids]
+    if label_scheme == "identity":
+        return distribution_ids
+    raise ValueError("label_scheme must be 'binary' or 'identity'")
+
+
+def distribution_labels_for_scheme(data_generator, label_scheme):
+    if label_scheme == "binary":
+        return data_generator.distribution_labels
+    if label_scheme == "identity":
+        return torch.arange(
+            data_generator.num_distributions,
+            device=data_generator.device,
+            dtype=torch.long,
+        )
+    raise ValueError("label_scheme must be 'binary' or 'identity'")
+
+
+def make_distribution_label_classifier(data_generator, label_scheme):
+    return BayesOptimalDistributionLabelClassifier(
+        distributions=data_generator.distributions,
+        distribution_labels=distribution_labels_for_scheme(
+            data_generator,
+            label_scheme,
+        ),
+        distribution_weights=data_generator.distribution_weights,
+        num_classes=num_classes_for_label_scheme(
+            label_scheme,
+            data_generator.num_distributions,
+        ),
+    )
+
+
+def sequence_baseline_accuracy(data_generator, eval_tokens, eval_targets, label_scheme):
+    if label_scheme == "identity":
+        return 1.0
+    if label_scheme == "binary":
+        bayes = BayesOptimalSequenceClassifier.from_generator(data_generator)
+        predictions = bayes.predict(eval_tokens)
+        return predictions.eq(eval_targets).float().mean().item()
+    raise ValueError("label_scheme must be 'binary' or 'identity'")
+
+
 @torch.no_grad()
-def model_autoregressive_losses(model, tokens, microbatch_size):
+def classification_losses(model, tokens, targets, microbatch_size):
     losses = []
     for start in range(0, tokens.shape[0], microbatch_size):
         stop = min(tokens.shape[0], start + microbatch_size)
-        batch_tokens = tokens[start:stop]
-        input_ids = batch_tokens[:, :-1]
-        targets = batch_tokens[:, 1:]
-        logits = model(input_ids)["logits"]
+        logits = model(tokens[start:stop])["logits"]
         batch_losses = F.cross_entropy(
-            logits.transpose(1, 2),
-            targets,
+            logits,
+            targets[start:stop],
             reduction="none",
-        ).mean(dim=1)
+        )
         losses.append(batch_losses.cpu())
     return torch.cat(losses)
 
 
-def make_balanced_eval_tokens(
-    data_generator,
-    eval_max_tasks,
-    eval_seqs_per_task,
-    sequence_length,
-    eval_seed,
-    device,
-):
-    eval_generator = make_torch_generator(device, eval_seed)
-    tracked_task_ids = torch.arange(
-        eval_max_tasks,
-        device=device,
-    ).repeat_interleave(eval_seqs_per_task)
-
-    train_generator = data_generator.generator
-    data_generator.generator = eval_generator
-    try:
-        tokens = data_generator.sample_from_distribution_ids(
-            tracked_task_ids,
-            sequence_length=sequence_length,
+@torch.no_grad()
+def predictor_losses(predictor, tokens, targets, microbatch_size):
+    losses = []
+    for start in range(0, tokens.shape[0], microbatch_size):
+        stop = min(tokens.shape[0], start + microbatch_size)
+        losses.append(
+            predictor.losses(
+                tokens[start:stop],
+                targets[start:stop],
+            ).cpu()
         )
-    finally:
-        data_generator.generator = train_generator
-
-    return tokens, tracked_task_ids
+    return torch.cat(losses)
 
 
 def mean_loss_by_task(losses, task_ids, task_counts, num_tasks):

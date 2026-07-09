@@ -9,6 +9,7 @@ run:
 
 data:
   type: dirichlet_zipf_binary
+  label_scheme: binary
   num_distributions: 10000
   num_states: 1000
   alpha: 0.1

@@ -10,7 +10,6 @@ def _():
     from pathlib import Path
 
     import torch
-    import torch.nn.functional as F
 
     repo_root = Path(__file__).resolve().parents[1]
     if str(repo_root) not in sys.path:
@@ -18,31 +17,36 @@ def _():
 
     from base.bit_sequences import SummarySequenceClassifierMLP
     from base.data_generator import DirichletZipfBinaryClassificationGenerator
-    from base.estimators import BayesOptimalDistributionLabelClassifier
-    from workbooks.train_model_helpers import (
+    from workbooks.classification_helpers import (
+        classification_losses,
         make_memorization_rows,
+        make_distribution_label_classifier,
         make_torch_generator,
         mean_loss_by_task,
+        num_classes_for_label_scheme,
         plot_memorization_by_task_rank,
         plot_memorization_fraction_over_time,
         plot_training_loss,
         plot_unmemorized_distribution_by_rank,
         resolve_device,
+        targets_for_distribution_labels,
     )
 
     return (
-        BayesOptimalDistributionLabelClassifier,
         DirichletZipfBinaryClassificationGenerator,
-        F,
         SummarySequenceClassifierMLP,
+        classification_losses,
         make_memorization_rows,
+        make_distribution_label_classifier,
         make_torch_generator,
         mean_loss_by_task,
+        num_classes_for_label_scheme,
         plot_memorization_by_task_rank,
         plot_memorization_fraction_over_time,
         plot_training_loss,
         plot_unmemorized_distribution_by_rank,
         resolve_device,
+        targets_for_distribution_labels,
         torch,
     )
 
@@ -88,31 +92,12 @@ def _():
 
 
 @app.cell
-def _(F, torch):
-    @torch.no_grad()
-    def model_classification_losses(model, tokens, targets, microbatch_size):
-        losses = []
-        for start in range(0, tokens.shape[0], microbatch_size):
-            stop = min(tokens.shape[0], start + microbatch_size)
-            logits = model(tokens[start:stop])["logits"]
-            batch_losses = F.cross_entropy(
-                logits,
-                targets[start:stop],
-                reduction="none",
-            )
-            losses.append(batch_losses.cpu())
-        return torch.cat(losses)
-
-    return (model_classification_losses,)
-
-
-@app.cell
 def _(
-    BayesOptimalDistributionLabelClassifier,
     DirichletZipfBinaryClassificationGenerator,
     SummarySequenceClassifierMLP,
     alpha,
     batch_size,
+    classification_losses,
     device_name,
     eval_interval,
     eval_max_distributions,
@@ -121,16 +106,18 @@ def _(
     eval_seqs_per_distribution,
     label_scheme,
     learning_rate,
+    make_distribution_label_classifier,
     make_torch_generator,
     max_iters,
     mean_loss_by_task,
     memorization_fraction,
-    model_classification_losses,
+    num_classes_for_label_scheme,
     num_distributions,
     num_states,
     resolve_device,
     seed,
     sequence_length,
+    targets_for_distribution_labels,
     torch,
     zipf_exponent,
 ):
@@ -147,12 +134,7 @@ def _(
         device=device,
         generator=rng,
     )
-    if label_scheme == "binary":
-        num_classes = 2
-    elif label_scheme == "identity":
-        num_classes = num_distributions
-    else:
-        raise ValueError("label_scheme must be 'binary' or 'identity'")
+    num_classes = num_classes_for_label_scheme(label_scheme, num_distributions)
 
     model = SummarySequenceClassifierMLP(
         vocab_size=num_states,
@@ -183,10 +165,10 @@ def _(
         )
     finally:
         data_generator.generator = train_generator
-    eval_targets = (
-        data_generator.distribution_labels[tracked_distribution_ids]
-        if label_scheme == "binary"
-        else tracked_distribution_ids
+    eval_targets = targets_for_distribution_labels(
+        data_generator,
+        tracked_distribution_ids,
+        label_scheme,
     )
 
     tracked_distribution_ids_cpu = tracked_distribution_ids.cpu()
@@ -195,17 +177,7 @@ def _(
         minlength=eval_max_distributions,
     )
     random_loss = torch.log(torch.tensor(float(num_classes))).item()
-    distribution_labels = (
-        data_generator.distribution_labels
-        if label_scheme == "binary"
-        else torch.arange(num_distributions, device=device, dtype=torch.long)
-    )
-    bayes = BayesOptimalDistributionLabelClassifier(
-        distributions=data_generator.distributions,
-        distribution_labels=distribution_labels,
-        distribution_weights=data_generator.distribution_weights,
-        num_classes=num_classes,
-    )
+    bayes = make_distribution_label_classifier(data_generator, label_scheme)
     bayes_eval_losses = bayes.losses(eval_tokens, eval_targets).cpu()
     tracked_distribution_bayes_loss = mean_loss_by_task(
         losses=bayes_eval_losses,
@@ -237,10 +209,10 @@ def _(
             sequence_length=sequence_length,
             return_distribution_ids=True,
         )
-        labels = (
-            data_generator.distribution_labels[distribution_ids]
-            if label_scheme == "binary"
-            else distribution_ids
+        labels = targets_for_distribution_labels(
+            data_generator,
+            distribution_ids,
+            label_scheme,
         )
         presentation_counts += torch.bincount(
             distribution_ids.cpu(),
@@ -263,7 +235,7 @@ def _(
         )
         if should_eval:
             model.eval()
-            eval_losses = model_classification_losses(
+            eval_losses = classification_losses(
                 model,
                 eval_tokens,
                 eval_targets,

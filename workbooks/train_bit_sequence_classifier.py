@@ -10,39 +10,40 @@ def _():
     from pathlib import Path
 
     import torch
-    import torch.nn.functional as F
 
     repo_root = Path(__file__).resolve().parents[1]
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
 
-    from base.bit_sequences import (
-        BayesOptimalSequenceClassifier,
-        SequenceClassifierMLP,
-        ZipfBitSequenceGenerator,
-    )
-    from workbooks.train_model_helpers import (
+    from base.bit_sequences import SequenceClassifierMLP, ZipfBitSequenceGenerator
+    from workbooks.classification_helpers import (
+        classification_losses,
         make_memorization_rows,
         make_torch_generator,
+        num_classes_for_label_scheme,
         plot_memorization_by_task_rank,
         plot_memorization_fraction_over_time,
         plot_training_loss,
         plot_unmemorized_distribution_by_rank,
         resolve_device,
+        sequence_baseline_accuracy,
+        targets_for_sequence_labels,
     )
 
     return (
-        BayesOptimalSequenceClassifier,
-        F,
         SequenceClassifierMLP,
         ZipfBitSequenceGenerator,
+        classification_losses,
         make_memorization_rows,
         make_torch_generator,
+        num_classes_for_label_scheme,
         plot_memorization_by_task_rank,
         plot_memorization_fraction_over_time,
         plot_training_loss,
         plot_unmemorized_distribution_by_rank,
         resolve_device,
+        sequence_baseline_accuracy,
+        targets_for_sequence_labels,
         torch,
     )
 
@@ -80,30 +81,11 @@ def _():
 
 
 @app.cell
-def _(F, torch):
-    @torch.no_grad()
-    def model_classification_losses(model, tokens, targets, microbatch_size):
-        losses = []
-        for start in range(0, tokens.shape[0], microbatch_size):
-            stop = min(tokens.shape[0], start + microbatch_size)
-            logits = model(tokens[start:stop])["logits"]
-            batch_losses = F.cross_entropy(
-                logits,
-                targets[start:stop],
-                reduction="none",
-            )
-            losses.append(batch_losses.cpu())
-        return torch.cat(losses)
-
-    return (model_classification_losses,)
-
-
-@app.cell
 def _(
-    BayesOptimalSequenceClassifier,
     SequenceClassifierMLP,
     ZipfBitSequenceGenerator,
     batch_size,
+    classification_losses,
     device_name,
     eval_interval,
     eval_max_sequences,
@@ -113,11 +95,13 @@ def _(
     make_torch_generator,
     max_iters,
     memorization_margin,
-    model_classification_losses,
+    num_classes_for_label_scheme,
     num_sequences,
     resolve_device,
     seed,
+    sequence_baseline_accuracy,
     sequence_length,
+    targets_for_sequence_labels,
     torch,
     zipf_exponent,
 ):
@@ -133,12 +117,7 @@ def _(
         device=device,
         generator=rng,
     )
-    if label_scheme == "binary":
-        num_classes = 2
-    elif label_scheme == "identity":
-        num_classes = num_sequences
-    else:
-        raise ValueError("label_scheme must be 'binary' or 'identity'")
+    num_classes = num_classes_for_label_scheme(label_scheme, num_sequences)
 
     model = SequenceClassifierMLP(
         sequence_length=sequence_length,
@@ -155,14 +134,17 @@ def _(
 
     tracked_sequence_ids = torch.arange(eval_max_sequences, device=device)
     eval_tokens = data_generator.sample_from_sequence_ids(tracked_sequence_ids)
-    if label_scheme == "binary":
-        eval_targets = data_generator.labels[tracked_sequence_ids]
-        bayes = BayesOptimalSequenceClassifier.from_generator(data_generator)
-        bayes_predictions = bayes.predict(eval_tokens)
-        bayes_accuracy = bayes_predictions.eq(eval_targets).float().mean().item()
-    else:
-        eval_targets = tracked_sequence_ids
-        bayes_accuracy = 1.0
+    eval_targets = targets_for_sequence_labels(
+        data_generator,
+        tracked_sequence_ids,
+        label_scheme,
+    )
+    bayes_accuracy = sequence_baseline_accuracy(
+        data_generator,
+        eval_tokens,
+        eval_targets,
+        label_scheme,
+    )
     chance_loss = torch.log(torch.tensor(float(num_classes))).item()
     bayes_loss = 0.0
 
@@ -185,10 +167,10 @@ def _(
             batch_size=batch_size,
             return_sequence_ids=True,
         )
-        labels = (
-            data_generator.labels[sequence_ids]
-            if label_scheme == "binary"
-            else sequence_ids
+        labels = targets_for_sequence_labels(
+            data_generator,
+            sequence_ids,
+            label_scheme,
         )
         presentation_counts += torch.bincount(
             sequence_ids.cpu(),
@@ -211,7 +193,7 @@ def _(
         )
         if should_eval:
             model.eval()
-            eval_losses = model_classification_losses(
+            eval_losses = classification_losses(
                 model,
                 eval_tokens,
                 eval_targets,

@@ -17,7 +17,6 @@ def _():
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
 
-    from base.estimators import BayesOptimalDistributionLabelClassifier
     from base.train_distribution_classifier import (
         build_data_generator,
         load_config,
@@ -27,16 +26,23 @@ def _():
         seed_everything,
         validate_config,
     )
+    from workbooks.classification_helpers import (
+        make_distribution_label_classifier,
+        mean_loss_by_task,
+        predictor_losses,
+    )
 
     return (
-        BayesOptimalDistributionLabelClassifier,
         Path,
         build_data_generator,
         load_config,
+        make_distribution_label_classifier,
         make_eval_batch,
         make_torch_generator,
+        mean_loss_by_task,
         pd,
         plt,
+        predictor_losses,
         resolve_device,
         seed_everything,
         torch,
@@ -123,9 +129,10 @@ def _(
 
 @app.cell
 def _(
-    BayesOptimalDistributionLabelClassifier,
+    config,
     data_generator,
     eval_batch,
+    make_distribution_label_classifier,
     max_eval_distributions,
     torch,
 ):
@@ -146,7 +153,10 @@ def _(
         minlength=num_eval_distributions,
     )
 
-    bayes = BayesOptimalDistributionLabelClassifier.from_generator(data_generator)
+    bayes = make_distribution_label_classifier(
+        data_generator,
+        config["data"].get("label_scheme", "binary"),
+    )
     random_loss = torch.log(torch.tensor(float(bayes.num_classes))).item()
 
     print(f"evaluated distributions: {num_eval_distributions:,}")
@@ -170,21 +180,13 @@ def _(data_generator, plt):
 
 
 @app.cell
-def _(bayes, eval_labels, eval_microbatch_size, eval_tokens, torch):
-    @torch.no_grad()
-    def bayes_losses_in_microbatches():
-        losses = []
-        for start in range(0, eval_tokens.shape[0], eval_microbatch_size):
-            stop = min(eval_tokens.shape[0], start + eval_microbatch_size)
-            losses.append(
-                bayes.losses(
-                    eval_tokens[start:stop],
-                    eval_labels[start:stop],
-                ).cpu()
-            )
-        return torch.cat(losses)
-
-    bayes_losses = bayes_losses_in_microbatches()
+def _(bayes, eval_labels, eval_microbatch_size, eval_tokens, predictor_losses):
+    bayes_losses = predictor_losses(
+        bayes,
+        eval_tokens,
+        eval_labels,
+        microbatch_size=eval_microbatch_size,
+    )
     return (bayes_losses,)
 
 
@@ -193,15 +195,16 @@ def _(
     bayes_losses,
     distribution_counts,
     eval_distribution_ids,
+    mean_loss_by_task,
     num_eval_distributions,
     pd,
     random_loss,
-    torch,
 ):
-    loss_sums = torch.zeros(num_eval_distributions, dtype=bayes_losses.dtype)
-    loss_sums.scatter_add_(0, eval_distribution_ids.cpu(), bayes_losses)
-    mean_losses = loss_sums / distribution_counts.clamp_min(1).to(
-        bayes_losses.dtype
+    mean_losses = mean_loss_by_task(
+        losses=bayes_losses,
+        task_ids=eval_distribution_ids.cpu(),
+        task_counts=distribution_counts.clamp_min(1),
+        num_tasks=num_eval_distributions,
     )
 
     summary = pd.DataFrame(

@@ -3,6 +3,22 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def make_mlp(input_dim, output_dim, hidden_dim, num_hidden_layers, dropout):
+    layers = []
+    for layer_index in range(num_hidden_layers):
+        layers.extend(
+            [
+                nn.Linear(input_dim if layer_index == 0 else hidden_dim, hidden_dim),
+                nn.GELU(),
+                nn.Dropout(dropout),
+            ]
+        )
+    layers.append(
+        nn.Linear(hidden_dim if num_hidden_layers else input_dim, output_dim)
+    )
+    return nn.Sequential(*layers)
+
+
 class ZipfBitSequenceGenerator:
     """Sample fixed bit sequences from a Zipf prior over sequence ranks."""
 
@@ -147,77 +163,6 @@ class ZipfBitSequenceGenerator:
         return self
 
 
-class BayesOptimalNextBitPredictor:
-    """Bayes optimal next-bit predictor for a Zipf prior over fixed sequences."""
-
-    def __init__(self, sequences, sequence_weights, eps=1e-30):
-        sequences = torch.as_tensor(sequences)
-        sequence_weights = torch.as_tensor(
-            sequence_weights,
-            device=sequences.device,
-            dtype=torch.float32,
-        )
-        if sequences.ndim != 2:
-            raise ValueError("sequences must have shape (num_sequences, sequence_length)")
-        if sequences.min() < 0 or sequences.max() > 1:
-            raise ValueError("sequences must contain only bits")
-        if sequence_weights.shape != (sequences.shape[0],):
-            raise ValueError("sequence_weights must have shape (num_sequences,)")
-        if torch.any(sequence_weights < 0) or sequence_weights.sum() <= 0:
-            raise ValueError("sequence_weights must be non-negative with positive mass")
-
-        self.sequences = sequences.to(dtype=torch.long)
-        self.sequence_weights = sequence_weights / sequence_weights.sum()
-        self.num_sequences, self.sequence_length = self.sequences.shape
-        self.eps = eps
-
-    @classmethod
-    def from_generator(cls, data_generator):
-        return cls(data_generator.sequences, data_generator.sequence_weights)
-
-    @torch.no_grad()
-    def predict_proba(self, prefixes):
-        prefixes = torch.as_tensor(prefixes, device=self.sequences.device)
-        if prefixes.ndim == 1:
-            prefixes = prefixes.unsqueeze(0)
-        if prefixes.ndim != 2:
-            raise ValueError("prefixes must have shape (batch_size, prefix_length)")
-        prefix_length = prefixes.shape[1]
-        if prefix_length < 1 or prefix_length >= self.sequence_length:
-            raise ValueError("prefix_length must be in [1, sequence_length)")
-        if prefixes.min() < 0 or prefixes.max() > 1:
-            raise ValueError("prefixes must contain only bits")
-
-        matches = self.sequences[:, :prefix_length].unsqueeze(0) == prefixes[:, None, :]
-        matching_weights = matches.all(dim=-1) * self.sequence_weights.unsqueeze(0)
-        denominator = matching_weights.sum(dim=1).clamp_min(self.eps)
-        next_bits = self.sequences[:, prefix_length].float()
-        probability_one = (matching_weights * next_bits.unsqueeze(0)).sum(dim=1)
-        probability_one = probability_one / denominator
-        return torch.stack([1.0 - probability_one, probability_one], dim=1)
-
-    @torch.no_grad()
-    def autoregressive_accuracies(self, tokens):
-        tokens = torch.as_tensor(tokens, device=self.sequences.device)
-        if tokens.ndim == 1:
-            tokens = tokens.unsqueeze(0)
-        if tokens.ndim != 2 or tokens.shape[1] != self.sequence_length:
-            raise ValueError("tokens must have shape (batch_size, sequence_length)")
-
-        correct = []
-        for prefix_length in range(1, self.sequence_length):
-            proba = self.predict_proba(tokens[:, :prefix_length])
-            predictions = proba.argmax(dim=1)
-            correct.append(predictions.eq(tokens[:, prefix_length]).float())
-        return torch.stack(correct, dim=1).mean(dim=1)
-
-    def to(self, device):
-        device = torch.device(device)
-        self.sequences = self.sequences.to(device)
-        self.sequence_weights = self.sequence_weights.to(device)
-        return self
-
-
 class BayesOptimalSequenceClassifier:
     """Bayes optimal binary-label classifier for exact fixed bit sequences."""
 
@@ -294,20 +239,13 @@ class SequenceClassifierMLP(nn.Module):
         if num_hidden_layers < 0:
             raise ValueError("num_hidden_layers must be nonnegative")
 
-        layers = []
-        input_dim = sequence_length
-        for layer_index in range(num_hidden_layers):
-            layers.extend(
-                [
-                    nn.Linear(input_dim if layer_index == 0 else hidden_dim, hidden_dim),
-                    nn.GELU(),
-                    nn.Dropout(dropout),
-                ]
-            )
-        layers.append(
-            nn.Linear(hidden_dim if num_hidden_layers else input_dim, num_classes)
+        self.net = make_mlp(
+            input_dim=sequence_length,
+            output_dim=num_classes,
+            hidden_dim=hidden_dim,
+            num_hidden_layers=num_hidden_layers,
+            dropout=dropout,
         )
-        self.net = nn.Sequential(*layers)
 
     def forward(self, tokens, targets=None):
         x = tokens.float()
@@ -344,23 +282,13 @@ class SummarySequenceClassifierMLP(nn.Module):
         self.init_std = embed_dim**-0.5
         self.token_embedding = nn.Embedding(vocab_size, embed_dim)
 
-        hidden_dim = mlp_ratio * embed_dim
-        layers = []
-        for layer_index in range(mlp_num_layers):
-            layers.extend(
-                [
-                    nn.Linear(
-                        embed_dim if layer_index == 0 else hidden_dim,
-                        hidden_dim,
-                    ),
-                    nn.GELU(),
-                    nn.Dropout(dropout),
-                ]
-            )
-        layers.append(
-            nn.Linear(hidden_dim if mlp_num_layers else embed_dim, num_classes)
+        self.mlp = make_mlp(
+            input_dim=embed_dim,
+            output_dim=num_classes,
+            hidden_dim=mlp_ratio * embed_dim,
+            num_hidden_layers=mlp_num_layers,
+            dropout=dropout,
         )
-        self.mlp = nn.Sequential(*layers)
         self.apply(self._init_weights)
 
     def _init_weights(self, module):

@@ -1,6 +1,5 @@
 import argparse
 import contextlib
-import csv
 import random
 import time
 from pathlib import Path
@@ -12,7 +11,16 @@ import yaml
 
 from base.bit_sequences import SummarySequenceClassifierMLP
 from base.data_generator import DirichletZipfBinaryClassificationGenerator
-from base.train import make_run_dir
+from base.training_utils import (
+    append_csv,
+    append_csv_rows,
+    format_duration,
+    load_config,
+    make_run_dir,
+    make_torch_generator,
+    resolve_device as resolve_device_base,
+    seed_everything,
+)
 
 
 MODEL_TYPES = {
@@ -32,36 +40,8 @@ def parse_args():
     return parser.parse_args()
 
 
-def load_config(path):
-    with path.open("r", encoding="utf-8") as f:
-        config = yaml.safe_load(f)
-    if not isinstance(config, dict):
-        raise ValueError("config must be a YAML mapping")
-    return config
-
-
 def resolve_device(name):
-    if name == "auto":
-        if torch.cuda.is_available():
-            return torch.device("cuda")
-        if torch.backends.mps.is_available():
-            return torch.device("mps")
-        return torch.device("cpu")
-    return torch.device(name)
-
-
-def seed_everything(seed):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-
-
-def make_torch_generator(device, seed):
-    if device.type not in ("cpu", "cuda"):
-        return None
-    return torch.Generator(device=device).manual_seed(seed)
+    return resolve_device_base(name, prefer_mps=True)
 
 
 def validate_config(config):
@@ -78,8 +58,15 @@ def validate_config(config):
         raise ValueError("model.vocab_size must equal data.num_states")
     if model["sequence_length"] != data["sequence_length"]:
         raise ValueError("model.sequence_length must equal data.sequence_length")
-    if model.get("num_classes", 2) != 2:
-        raise ValueError("this trainer currently supports binary labels only")
+    label_scheme = data.get("label_scheme", "binary")
+    if label_scheme not in ("binary", "identity"):
+        raise ValueError("data.label_scheme must be 'binary' or 'identity'")
+    expected_classes = 2 if label_scheme == "binary" else data["num_distributions"]
+    if model.get("num_classes", expected_classes) != expected_classes:
+        raise ValueError(
+            "model.num_classes must be 2 for binary labels or "
+            "data.num_distributions for identity labels"
+        )
     if training["max_iters"] < 1:
         raise ValueError("training.max_iters must be at least 1")
     if training["checkpoint_interval"] < 1:
@@ -98,6 +85,7 @@ def validate_config(config):
 def build_data_generator(config, device, generator, checkpoint=None):
     data = dict(config["data"])
     data.pop("type")
+    data.pop("label_scheme", None)
     data.pop("sequence_length")
     data.pop("batch_size")
     if checkpoint is not None:
@@ -153,49 +141,37 @@ def make_grad_scaler(config, device):
     return torch.amp.GradScaler("cuda", enabled=enabled)
 
 
-def autocast_kwargs(device, amp_dtype):
-    return {
-        "device_type": device.type,
-        "dtype": amp_dtype,
-        "enabled": amp_dtype is not None,
-    }
-
-
 def autocast_context(device, amp_dtype):
     if amp_dtype is None:
         return contextlib.nullcontext()
-    return torch.amp.autocast(**autocast_kwargs(device, amp_dtype))
+    return torch.amp.autocast(device_type=device.type, dtype=amp_dtype)
 
 
-def rng_state(train_generator, eval_generator):
+def rng_state(train_generator):
     state = {
         "python": random.getstate(),
         "numpy": np.random.get_state(),
         "torch": torch.get_rng_state(),
         "train_generator": None,
-        "eval_generator": None,
     }
     if torch.cuda.is_available():
         state["cuda"] = torch.cuda.get_rng_state_all()
     if train_generator is not None:
         state["train_generator"] = train_generator.get_state()
-    if eval_generator is not None:
-        state["eval_generator"] = eval_generator.get_state()
     return state
 
 
-def set_rng_state(state, train_generator, eval_generator):
+def set_rng_state(state, train_generator):
     if not state:
         return
     random.setstate(state["python"])
-    np.random.set_state(state["numpy"])
+    if "numpy" in state:
+        np.random.set_state(state["numpy"])
     torch.set_rng_state(state["torch"])
     if torch.cuda.is_available() and "cuda" in state:
         torch.cuda.set_rng_state_all(state["cuda"])
     if train_generator is not None and state.get("train_generator") is not None:
         train_generator.set_state(state["train_generator"])
-    if eval_generator is not None and state.get("eval_generator") is not None:
-        eval_generator.set_state(state["eval_generator"])
 
 
 def save_checkpoint(
@@ -217,7 +193,7 @@ def save_checkpoint(
             "iteration": iteration,
             "config": config,
             "run_dir": str(run_dir),
-            "rng_state": rng_state(train_generator, None),
+            "rng_state": rng_state(train_generator),
             "presentation_counts": presentation_counts.cpu(),
             "distributions": data_generator.distributions.cpu(),
             "distribution_labels": data_generator.distribution_labels.cpu(),
@@ -225,24 +201,6 @@ def save_checkpoint(
         },
         path,
     )
-
-
-def append_csv(path, fieldnames, row):
-    exists = path.exists()
-    with path.open("a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        if not exists:
-            writer.writeheader()
-        writer.writerow(row)
-
-
-def append_csv_rows(path, fieldnames, rows):
-    exists = path.exists()
-    with path.open("a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        if not exists:
-            writer.writeheader()
-        writer.writerows(rows)
 
 
 def make_eval_batch(data_generator, config, eval_generator):
@@ -260,13 +218,18 @@ def make_eval_batch(data_generator, config, eval_generator):
     train_generator = data_generator.generator
     data_generator.generator = eval_generator
     try:
-        tokens, labels = data_generator.sample_from_distribution_ids(
+        tokens, binary_labels = data_generator.sample_from_distribution_ids(
             ids,
             sequence_length=config["data"]["sequence_length"],
             return_labels=True,
         )
     finally:
         data_generator.generator = train_generator
+    labels = (
+        ids
+        if config["data"].get("label_scheme", "binary") == "identity"
+        else binary_labels
+    )
     return {"tokens": tokens, "labels": labels, "distribution_ids": ids}
 
 
@@ -328,17 +291,6 @@ def move_eval_batch(eval_batch, device):
     return {key: value.to(device) for key, value in eval_batch.items()}
 
 
-def format_duration(seconds):
-    seconds = max(0, int(seconds))
-    hours, remainder = divmod(seconds, 3600)
-    minutes, seconds = divmod(remainder, 60)
-    if hours:
-        return f"{hours}h{minutes:02d}m{seconds:02d}s"
-    if minutes:
-        return f"{minutes}m{seconds:02d}s"
-    return f"{seconds}s"
-
-
 def resolve_run_dir(config, checkpoint):
     if checkpoint is not None:
         return Path(checkpoint["run_dir"])
@@ -396,7 +348,7 @@ def main():
             device=device,
             dtype=torch.long,
         )
-        set_rng_state(checkpoint.get("rng_state"), train_generator, None)
+        set_rng_state(checkpoint.get("rng_state"), train_generator)
         eval_batch = move_eval_batch(checkpoint["eval_batch"], device)
     else:
         eval_batch = make_eval_batch(data_generator, config, eval_generator)
@@ -418,11 +370,16 @@ def main():
     log_interval = config["training"].get("log_interval", report_interval)
     model.train()
     for iteration in range(start_iter + 1, max_iters + 1):
-        tokens, distribution_ids, labels = data_generator.sample(
+        tokens, distribution_ids, binary_labels = data_generator.sample(
             batch_size=config["data"]["batch_size"],
             sequence_length=config["data"]["sequence_length"],
             return_distribution_ids=True,
             return_labels=True,
+        )
+        labels = (
+            distribution_ids
+            if config["data"].get("label_scheme", "binary") == "identity"
+            else binary_labels
         )
         presentation_counts += torch.bincount(
             distribution_ids,
