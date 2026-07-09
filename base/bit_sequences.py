@@ -290,6 +290,7 @@ class SummarySequenceClassifierMLP(nn.Module):
         self.embed_dim = embed_dim
         self.init_std = embed_dim**-0.5
         self.token_embedding = nn.Embedding(vocab_size, embed_dim)
+        self.input_layer_norm = nn.LayerNorm(embed_dim, elementwise_affine=False)
 
         self.mlp = make_mlp(
             input_dim=embed_dim,
@@ -314,6 +315,7 @@ class SummarySequenceClassifierMLP(nn.Module):
 
         x = self.token_embedding(tokens)
         x = x.mean(dim=1)
+        x = self.input_layer_norm(x)
         logits = self.mlp(x)
         loss = None
         if targets is not None:
