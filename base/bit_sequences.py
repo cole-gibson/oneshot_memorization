@@ -227,7 +227,7 @@ class SequenceClassifierMLP(nn.Module):
         self,
         sequence_length,
         num_classes,
-        hidden_dim=256,
+        embed_dim=256,
         num_hidden_layers=2,
         dropout=0.0,
     ):
@@ -239,16 +239,25 @@ class SequenceClassifierMLP(nn.Module):
         if num_hidden_layers < 0:
             raise ValueError("num_hidden_layers must be nonnegative")
 
+        self.sequence_length = sequence_length
+        self.embed_dim = embed_dim
+        self.sequence_embedding = nn.Parameter(torch.empty(sequence_length, embed_dim))
+        self.input_layer_norm = nn.LayerNorm(embed_dim, elementwise_affine=False)
+        nn.init.normal_(self.sequence_embedding, mean=0.0, std=embed_dim**-0.5)
         self.net = make_mlp(
-            input_dim=sequence_length,
+            input_dim=sequence_length * embed_dim,
             output_dim=num_classes,
-            hidden_dim=hidden_dim,
+            hidden_dim=4 * embed_dim,
             num_hidden_layers=num_hidden_layers,
             dropout=dropout,
         )
 
     def forward(self, tokens, targets=None):
-        x = tokens.float()
+        if tokens.shape[1] != self.sequence_length:
+            raise ValueError("tokens must have shape (batch_size, sequence_length)")
+        signed_tokens = 2.0 * tokens.float() - 1.0
+        x = signed_tokens.unsqueeze(-1) * self.sequence_embedding
+        x = self.input_layer_norm(x).flatten(start_dim=1)
         logits = self.net(x)
         loss = None
         if targets is not None:
