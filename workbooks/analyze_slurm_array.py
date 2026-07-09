@@ -329,6 +329,81 @@ def _(threshold_df):
 
 
 @app.cell
+def _(eval_df, loss_threshold, pd, plt, run_df, sns):
+    _plot_df = eval_df.copy()
+    _plot_df["is_memorized"] = _plot_df["rolling_eval_loss"] < loss_threshold
+    _plot_df = (
+        _plot_df.groupby(["run_id", "iteration"], as_index=False)["is_memorized"]
+        .mean()
+        .rename(columns={"is_memorized": "memorized_fraction"})
+    )
+    _plot_df = _plot_df.merge(
+        run_df[["run_id", "num_parameters"]],
+        on="run_id",
+        how="left",
+    )
+    _plot_df = _plot_df.dropna(subset=["num_parameters"])
+    _plot_df["num_parameters"] = pd.to_numeric(_plot_df["num_parameters"])
+
+    _fig, _ax = plt.subplots(figsize=(8, 5))
+    sns.lineplot(
+        data=_plot_df,
+        x="iteration",
+        y="memorized_fraction",
+        hue="num_parameters",
+        palette="viridis",
+        ax=_ax,
+    )
+    _ax.set_xscale("log")
+    _ax.set_ylim(-0.02, 1.02)
+    _ax.set_xlabel("Iteration")
+    _ax.set_ylabel("Memorized fraction")
+    _ax.set_title("Memorized fraction over time by parameter count")
+    _fig
+    return
+
+
+@app.cell
+def _(plt, sns, threshold_df):
+    _plot_df = threshold_df.dropna(subset=["min_training_seen_count"]).copy()
+    if _plot_df.empty:
+        _fig, _ax = plt.subplots(figsize=(7, 4))
+        _ax.text(
+            0.5,
+            0.5,
+            "No memorized distributions",
+            ha="center",
+            va="center",
+            transform=_ax.transAxes,
+        )
+        _ax.set_axis_off()
+    else:
+        _grid = sns.displot(
+            data=_plot_df,
+            x="distribution_rank",
+            col="parameter_setting",
+            col_wrap=2,
+            bins=30,
+            height=3.2,
+            aspect=1.3,
+            facet_kws={"sharey": False},
+        )
+        _grid.set(
+            # xscale="log",
+            xlabel="Task rank",
+            ylabel="Memorized tasks",
+        )
+        _grid.set_titles("{col_name}")
+        _grid.fig.suptitle(
+            "Distribution of memorized tasks by task rank",
+            y=1.02,
+        )
+        _fig = _grid.fig
+    _fig
+    return
+
+
+@app.cell
 def _(pd, plt, sns, threshold_df):
     _plot_df = threshold_df.dropna(subset=["min_training_seen_count"]).copy()
     _plot_df["min_training_seen_count"] = pd.to_numeric(
@@ -358,7 +433,7 @@ def _(pd, plt, sns, threshold_df):
             facet_kws={"sharey": False},
         )
         _grid.set(
-            xscale="log",
+            # xscale="log",
             xlabel="Training appearances at memorization",
             ylabel="Distributions",
         )
@@ -398,10 +473,10 @@ def _(pd, plt, sns, threshold_df):
         yerr=[_lower_error, _lower_error * 0],
         fmt="none",
         ecolor="0.35",
-        # elinewidth=0.8,
-        # capsize=2,
-        elinewidth=0.,
-        capsize=0,
+        elinewidth=0.8,
+        capsize=2,
+        # elinewidth=0.,
+        # capsize=0,
         alpha=0.6,
         zorder=1.5,
     )
