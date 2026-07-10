@@ -37,10 +37,10 @@ def _():
 @app.cell
 def _(Path):
     array_output_dir = Path(
-        "/home/cg5763/data/output_oneshot_memorization/scaling-garnet-jackalope"
+        "/home/cg5763/data/output_oneshot_memorization/distribution-vector-benchmark-voracious-oyster"
     )
-    loss_threshold = 0.1
-    loss_average_window = 10
+    loss_threshold = 0.001
+    loss_average_window = 1
     initialization_exclusion_iterations = 100
     exclude_first_evaluation_memorizations = True
     rank_bin_count = 20
@@ -593,10 +593,10 @@ def _(exclude_first_evaluation_memorizations, pd, plt, sns, threshold_df):
                 yerr=[_facet_df["lower_error"], _facet_df["lower_error"] * 0],
                 fmt="none",
                 ecolor="0.35",
-                # elinewidth=0.8,
-                # capsize=2,
-                elinewidth=0.,
-                capsize=0,
+                elinewidth=0.8,
+                capsize=2,
+                # elinewidth=0.,
+                # capsize=0,
                 alpha=0.6,
                 zorder=1.5,
             )

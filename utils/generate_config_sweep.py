@@ -6,14 +6,52 @@ import yaml
 
 
 # Sweep configuration. Use a string for one path or a tuple for coupled paths.
-REFERENCE_CONFIG = Path("sample_configs/distribution_classifier.yaml")
-OUTPUT_DIR = Path("configs/sweeps")
+
+###########
+
+# REFERENCE_CONFIG = Path("sample_configs/bit_sequence_classifier.yaml")
+# OUTPUT_DIR = Path("configs/bit_sequence")
+# SWEEP = [
+#     (("training.max_iters"), [1000]),
+#     (("training.report_interval"), [100]),
+#     (("training.checkpoint_interval"), [1000]),
+
+#     (("data.num_sequences"), [10000]),
+#     (("data.batch_size"), [256]),
+
+#     (("model.hidden_dim"), [1024, 2048, 4096, 8192]),
+
+#     (("evaluation.spacing"), ['linear']),
+#     (("evaluation.interval"), [16]),
+#     (("evaluation.num_sequences"), [10000]),
+#     (("evaluation.microbatch_size"), [10000])
+# ]
+# EXPERIMENT_NAME = 'bit_sequence_benchmark'
+# DESCRIPTION = None
+# OVERWRITE = True
+
+############
+
+REFERENCE_CONFIG = Path("sample_configs/distribution_vector_classifier.yaml")
+OUTPUT_DIR = Path("configs/distribution_vector")
 SWEEP = [
-    (("data.sequence_length", "model.sequence_length"), [32, 64]),
+    (("training.max_iters"), [1000]),
+    (("training.report_interval"), [100]),
+    (("training.checkpoint_interval"), [1000]),
+
+    (("data.num_distributions"), [10000]),
+    (("data.batch_size"), [256]),
+
+    (("model.embed_dim"), [256, 512, 1024, 2048]),
+
+    (("evaluation.spacing"), ['linear']),
+    (("evaluation.interval"), [16]),
+    (("evaluation.num_distributions"), [10000]),
+    (("evaluation.microbatch_size"), [10000])
 ]
-EXPERIMENT_NAME = None
+EXPERIMENT_NAME = 'distribution_vector_benchmark'
 DESCRIPTION = None
-OVERWRITE = False
+OVERWRITE = True
 
 
 def load_yaml(path):
