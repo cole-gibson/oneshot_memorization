@@ -35,6 +35,7 @@ optimizer:
 
 training:
   max_iters: 500000
+  compile: true
   report_interval: 10000
   checkpoint_interval: 50000
   grad_clip_norm:

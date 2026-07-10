@@ -42,6 +42,7 @@ TRAINING_PHASES = (
     "backward",
     "grad_unscale_and_clip",
     "optimizer_step_and_scaler_update",
+    "compiled_training_update",
     "training_step_total",
 )
 
@@ -267,6 +268,8 @@ def validate_config(config):
         raise ValueError("evaluation.seqs_per_distribution must be at least 1")
     if training.get("log_interval", 1) < 1:
         raise ValueError("training.log_interval must be at least 1")
+    if not isinstance(training.get("compile", False), bool):
+        raise ValueError("training.compile must be a boolean")
     amp_dtype = training.get("amp_dtype")
     if amp_dtype not in (None, "bf16", "fp16"):
         raise ValueError("training.amp_dtype must be one of null, 'bf16', or 'fp16'")
@@ -351,6 +354,46 @@ def autocast_context(device, amp_dtype):
     if amp_dtype is None:
         return contextlib.nullcontext()
     return torch.amp.autocast(device_type=device.type, dtype=amp_dtype)
+
+
+def make_compiled_training_step(
+    model,
+    optimizer,
+    grad_scaler,
+    device,
+    amp_dtype,
+    grad_clip_norm,
+):
+    """Compile one complete parameter update, excluding data generation."""
+
+    def training_step(tokens, labels):
+        optimizer.zero_grad(set_to_none=True)
+        with autocast_context(device, amp_dtype):
+            loss = model(tokens, targets=labels)["loss"]
+        if grad_scaler.is_enabled():
+            grad_scaler.scale(loss).backward()
+            if grad_clip_norm is not None:
+                grad_scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+            grad_scaler.step(optimizer)
+            grad_scaler.update()
+        else:
+            loss.backward()
+            if grad_clip_norm is not None:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip_norm)
+            optimizer.step()
+        return loss
+
+    compiled_step = torch.compile(training_step)
+    if amp_dtype is None:
+        return compiled_step
+
+    def compiled_step_with_amp_semantics(tokens, labels):
+        # AMP wraps only forward/loss; backward executes outside autocast.
+        with torch._functorch.config.patch(backward_pass_autocast="off"):
+            return compiled_step(tokens, labels)
+
+    return compiled_step_with_amp_semantics
 
 
 def rng_state(train_generator):
@@ -599,9 +642,20 @@ def main():
         with timing.phase("eval_batch_init", start_iter, synchronize_cuda=True):
             eval_batch = make_eval_batch(data_generator, config, eval_generator)
 
-    forward_model = model
-    if config["training"].get("compile", False):
-        forward_model = torch.compile(model)
+    compile_training = config["training"].get("compile", False)
+    compiled_training_step = None
+    if compile_training:
+        grad_clip_norm = config["training"].get("grad_clip_norm")
+        if grad_clip_norm is not None:
+            grad_clip_norm = float(grad_clip_norm)
+        compiled_training_step = make_compiled_training_step(
+            model,
+            optimizer,
+            grad_scaler,
+            device,
+            amp_dtype,
+            grad_clip_norm,
+        )
 
     train_log = run_dir / "train_log.csv"
     eval_log = run_dir / "eval_by_distribution.csv"
@@ -634,23 +688,25 @@ def main():
                 distribution_ids,
                 minlength=config["data"]["num_distributions"],
             )
-            optimizer.zero_grad(set_to_none=True)
-            with autocast_context(device, amp_dtype):
-                loss = forward_model(tokens, targets=labels)["loss"]
-            grad_scaler.scale(loss).backward()
-            if config["training"].get("grad_clip_norm") is not None:
-                grad_scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(
-                    model.parameters(),
-                    float(config["training"]["grad_clip_norm"]),
-                )
-            grad_scaler.step(optimizer)
-            grad_scaler.update()
+            if compile_training:
+                loss = compiled_training_step(tokens, labels)
+            else:
+                optimizer.zero_grad(set_to_none=True)
+                with autocast_context(device, amp_dtype):
+                    loss = model(tokens, targets=labels)["loss"]
+                grad_scaler.scale(loss).backward()
+                if config["training"].get("grad_clip_norm") is not None:
+                    grad_scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(
+                        model.parameters(),
+                        float(config["training"]["grad_clip_norm"]),
+                    )
+                grad_scaler.step(optimizer)
+                grad_scaler.update()
         else:
             measure_iteration = timing.is_training_iteration(iteration)
             compile_first = (
-                config["training"].get("compile", False)
-                and iteration == start_iter + 1
+                compile_training and iteration == start_iter + 1
             )
             if compile_first and device.type == "cuda":
                 torch.cuda.synchronize(device)
@@ -692,53 +748,63 @@ def main():
                         minlength=config["data"]["num_distributions"],
                     )
 
-                with timing.phase(
-                    "zero_grad",
-                    iteration,
-                    batch_size,
-                    use_cuda_events=True,
-                    active=measure_iteration,
-                ):
-                    optimizer.zero_grad(set_to_none=True)
-                with timing.phase(
-                    "forward_and_loss",
-                    iteration,
-                    batch_size,
-                    use_cuda_events=True,
-                    active=measure_iteration,
-                ):
-                    with autocast_context(device, amp_dtype):
-                        loss = forward_model(tokens, targets=labels)["loss"]
-                with timing.phase(
-                    "backward",
-                    iteration,
-                    batch_size,
-                    use_cuda_events=True,
-                    active=measure_iteration,
-                ):
-                    grad_scaler.scale(loss).backward()
-                if config["training"].get("grad_clip_norm") is not None:
+                if compile_training:
                     with timing.phase(
-                        "grad_unscale_and_clip",
+                        "compiled_training_update",
                         iteration,
                         batch_size,
                         use_cuda_events=True,
                         active=measure_iteration,
                     ):
-                        grad_scaler.unscale_(optimizer)
-                        torch.nn.utils.clip_grad_norm_(
-                            model.parameters(),
-                            float(config["training"]["grad_clip_norm"]),
-                        )
-                with timing.phase(
-                    "optimizer_step_and_scaler_update",
-                    iteration,
-                    batch_size,
-                    use_cuda_events=True,
-                    active=measure_iteration,
-                ):
-                    grad_scaler.step(optimizer)
-                    grad_scaler.update()
+                        loss = compiled_training_step(tokens, labels)
+                else:
+                    with timing.phase(
+                        "zero_grad",
+                        iteration,
+                        batch_size,
+                        use_cuda_events=True,
+                        active=measure_iteration,
+                    ):
+                        optimizer.zero_grad(set_to_none=True)
+                    with timing.phase(
+                        "forward_and_loss",
+                        iteration,
+                        batch_size,
+                        use_cuda_events=True,
+                        active=measure_iteration,
+                    ):
+                        with autocast_context(device, amp_dtype):
+                            loss = model(tokens, targets=labels)["loss"]
+                    with timing.phase(
+                        "backward",
+                        iteration,
+                        batch_size,
+                        use_cuda_events=True,
+                        active=measure_iteration,
+                    ):
+                        grad_scaler.scale(loss).backward()
+                    if config["training"].get("grad_clip_norm") is not None:
+                        with timing.phase(
+                            "grad_unscale_and_clip",
+                            iteration,
+                            batch_size,
+                            use_cuda_events=True,
+                            active=measure_iteration,
+                        ):
+                            grad_scaler.unscale_(optimizer)
+                            torch.nn.utils.clip_grad_norm_(
+                                model.parameters(),
+                                float(config["training"]["grad_clip_norm"]),
+                            )
+                    with timing.phase(
+                        "optimizer_step_and_scaler_update",
+                        iteration,
+                        batch_size,
+                        use_cuda_events=True,
+                        active=measure_iteration,
+                    ):
+                        grad_scaler.step(optimizer)
+                        grad_scaler.update()
             if compile_first:
                 if device.type == "cuda":
                     torch.cuda.synchronize(device)
@@ -806,7 +872,7 @@ def main():
             or iteration == start_iter + 1
         ):
             evaluate(
-                forward_model,
+                model,
                 data_generator,
                 config,
                 eval_batch,

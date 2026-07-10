@@ -120,6 +120,7 @@ class BenchmarkTimingTest(unittest.TestCase):
                 self.assertTrue(rows[phase]["mean_ms"])
             self.assertEqual(int(rows["grad_unscale_and_clip"]["num_calls"]), 0)
             self.assertEqual(rows["grad_unscale_and_clip"]["mean_ms"], "")
+            self.assertEqual(int(rows["compiled_training_update"]["num_calls"]), 0)
 
             subphase_total = sum(
                 float(rows[phase]["total_ms"])
@@ -153,7 +154,51 @@ class BenchmarkTimingTest(unittest.TestCase):
                     atol=0,
                 )
 
+    def test_compiled_benchmark_uses_one_fused_update_phase(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            run_dir = root / "compiled"
+            config = make_config(run_dir, True)
+            config["training"]["compile"] = True
+            config["training"]["max_iters"] = 3
+            config["training"]["checkpoint_interval"] = 3
+            config["evaluation"]["interval"] = 3
+            config["benchmark"]["measure_iters"] = 1
+
+            with mock.patch(
+                "base.train_distribution_classifier.torch.compile",
+                side_effect=lambda function: function,
+            ) as compile_mock:
+                run_training(config, root / "compiled_config.yaml")
+            compile_mock.assert_called_once()
+
+            with (run_dir / "timing.csv").open(
+                newline="", encoding="utf-8"
+            ) as file:
+                rows = {row["phase"]: row for row in csv.DictReader(file)}
+
+            self.assertEqual(
+                int(rows["compiled_training_update"]["num_calls"]), 1
+            )
+            self.assertEqual(
+                int(rows["compiled_training_update"]["num_examples"]), 4
+            )
+            self.assertEqual(int(rows["compile_first_step"]["num_calls"]), 1)
+            for eager_phase in (
+                "zero_grad",
+                "forward_and_loss",
+                "backward",
+                "grad_unscale_and_clip",
+                "optimizer_step_and_scaler_update",
+            ):
+                self.assertEqual(int(rows[eager_phase]["num_calls"]), 0)
+
     def test_benchmark_validation(self):
+        config = make_config("unused", True)
+        config["training"]["compile"] = "yes"
+        with self.assertRaisesRegex(ValueError, "training.compile"):
+            validate_config(config)
+
         config = make_config("unused", True)
         config["benchmark"]["warmup_iters"] = -1
         with self.assertRaisesRegex(ValueError, "warmup_iters"):

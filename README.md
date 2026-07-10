@@ -29,3 +29,9 @@ CUDA computational timings use events on the current stream. They measure GPU
 execution time and exclude Python dispatch overhead; `training_step_total`
 provides the aggregate device time for the measured training steps. CPU and
 host-I/O timings use wall time. Benchmark mode is unsupported on MPS.
+
+With `training.compile: true`, the complete parameter update (zeroing gradients,
+forward and loss, backward, optional clipping, and optimizer step) is compiled
+as one function. Its steady-state time is reported as `compiled_training_update`;
+the corresponding eager-only subphase rows have zero calls because compiled
+kernel work cannot be attributed to them without breaking the compiled region.
