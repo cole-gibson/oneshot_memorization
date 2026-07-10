@@ -39,6 +39,11 @@ training:
   checkpoint_interval: 50000
   grad_clip_norm:
 
+benchmark:
+  enabled: false
+  warmup_iters: 50
+  measure_iters: 200
+
 evaluation:
   interval: 500
   seed: 12345
