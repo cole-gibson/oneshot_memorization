@@ -1,5 +1,6 @@
 import argparse
 import contextlib
+import math
 import random
 import time
 from pathlib import Path
@@ -95,9 +96,29 @@ def validate_config(config):
         raise ValueError("training.max_iters must be at least 1")
     if training["checkpoint_interval"] < 1:
         raise ValueError("training.checkpoint_interval must be at least 1")
-    if evaluation["interval"] < 1:
+    evaluation_spacing = evaluation.get("spacing", "linear")
+    if evaluation_spacing not in ("linear", "logarithmic"):
+        raise ValueError(
+            "evaluation.spacing must be 'linear' or 'logarithmic'"
+        )
+    if evaluation_spacing == "linear" and evaluation["interval"] < 1:
         raise ValueError("evaluation.interval must be at least 1")
-    if evaluation["seqs_per_distribution"] < 1:
+    points_per_decade = evaluation.get("points_per_decade", 10)
+    if evaluation_spacing == "logarithmic" and (
+        not isinstance(points_per_decade, int)
+        or isinstance(points_per_decade, bool)
+        or points_per_decade < 1
+    ):
+        raise ValueError(
+            "evaluation.points_per_decade must be a positive integer"
+        )
+    if is_probability_vector:
+        if evaluation.get("seqs_per_distribution", 1) != 1:
+            raise ValueError(
+                "evaluation.seqs_per_distribution must be 1 for probability "
+                "vector data"
+            )
+    elif evaluation["seqs_per_distribution"] < 1:
         raise ValueError("evaluation.seqs_per_distribution must be at least 1")
     if training.get("log_interval", 1) < 1:
         raise ValueError("training.log_interval must be at least 1")
@@ -128,6 +149,18 @@ def build_model(config):
     model = dict(config["model"])
     model_type = model.pop("type")
     return MODEL_TYPES[model_type](**model)
+
+
+def logarithmic_evaluation_iterations(max_iters, points_per_decade):
+    """Return integer iterations spaced uniformly on a base-10 log scale."""
+    max_exponent = math.ceil(points_per_decade * math.log10(max_iters))
+    iterations = {
+        round(10 ** (exponent / points_per_decade))
+        for exponent in range(max_exponent + 1)
+    }
+    iterations = {iteration for iteration in iterations if iteration <= max_iters}
+    iterations.add(max_iters)
+    return iterations
 
 
 def build_optimizer(model, config, device):
@@ -277,7 +310,7 @@ def make_eval_batch(data_generator, config, eval_generator):
         ),
         config["data"]["num_distributions"],
     )
-    seqs_per_distribution = config["evaluation"]["seqs_per_distribution"]
+    seqs_per_distribution = config["evaluation"].get("seqs_per_distribution", 1)
     ids = torch.arange(num_distributions, device=data_generator.device)
     ids = ids.repeat_interleave(seqs_per_distribution)
 
@@ -450,9 +483,15 @@ def main():
     max_iters = int(config["training"]["max_iters"])
     report_interval = config["training"].get(
         "report_interval",
-        config["evaluation"]["interval"],
+        config["evaluation"].get("interval", max(1, max_iters // 10)),
     )
     log_interval = config["training"].get("log_interval", report_interval)
+    logarithmic_eval_iterations = None
+    if config["evaluation"].get("spacing", "linear") == "logarithmic":
+        logarithmic_eval_iterations = logarithmic_evaluation_iterations(
+            max_iters,
+            config["evaluation"].get("points_per_decade", 10),
+        )
     model.train()
     for iteration in range(start_iter + 1, max_iters + 1):
         batch_size = config["data"]["batch_size"]
@@ -539,10 +578,16 @@ def main():
             )
             last_report_time = now
             last_report_iter = iteration
-        if (
-            iteration % config["evaluation"]["interval"] == 0
-            or iteration == start_iter + 1
-        ):
+        should_evaluate = iteration == start_iter + 1
+        if logarithmic_eval_iterations is None:
+            should_evaluate = should_evaluate or (
+                iteration % config["evaluation"]["interval"] == 0
+            )
+        else:
+            should_evaluate = (
+                should_evaluate or iteration in logarithmic_eval_iterations
+            )
+        if should_evaluate:
             evaluate(
                 model,
                 data_generator,

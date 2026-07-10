@@ -9,6 +9,7 @@ from base.bit_sequences import (
 )
 from base.data_generator import DirichletZipfBinaryProbabilityVectorGenerator
 from base.train_distribution_classifier import (
+    logarithmic_evaluation_iterations,
     make_compiled_training_step,
     validate_config,
 )
@@ -85,6 +86,46 @@ class CompiledTrainingStepTest(unittest.TestCase):
         )
 
 
+class EvaluationScheduleTest(unittest.TestCase):
+    def test_logarithmic_iterations_have_configured_density(self):
+        self.assertEqual(
+            logarithmic_evaluation_iterations(100, points_per_decade=2),
+            {1, 3, 10, 32, 100},
+        )
+
+    def test_logarithmic_iterations_include_non_power_of_ten_final_iteration(self):
+        self.assertEqual(
+            logarithmic_evaluation_iterations(25, points_per_decade=1),
+            {1, 10, 25},
+        )
+
+    def test_logarithmic_config_does_not_require_linear_interval(self):
+        config = make_config()
+        config["evaluation"] = {
+            "spacing": "logarithmic",
+            "points_per_decade": 4,
+            "seqs_per_distribution": 1,
+        }
+
+        validate_config(config)
+
+    def test_logarithmic_density_must_be_a_positive_integer(self):
+        for value in (0, 1.5, True):
+            with self.subTest(value=value):
+                config = make_config()
+                config["evaluation"]["spacing"] = "logarithmic"
+                config["evaluation"]["points_per_decade"] = value
+                with self.assertRaisesRegex(ValueError, "points_per_decade"):
+                    validate_config(config)
+
+    def test_unknown_spacing_is_rejected(self):
+        config = make_config()
+        config["evaluation"]["spacing"] = "geometric"
+
+        with self.assertRaisesRegex(ValueError, "evaluation.spacing"):
+            validate_config(config)
+
+
 class ProbabilityVectorSettingTest(unittest.TestCase):
     def test_generator_returns_selected_probability_vectors_and_labels(self):
         distributions = torch.tensor([[0.8, 0.2], [0.1, 0.9]])
@@ -128,6 +169,7 @@ class ProbabilityVectorSettingTest(unittest.TestCase):
         config = make_config()
         config["data"]["type"] = "dirichlet_zipf_binary_probability_vector"
         config["data"].pop("sequence_length")
+        config["evaluation"].pop("seqs_per_distribution")
         config["model"] = {
             "type": "probability_mlp",
             "vocab_size": 7,
@@ -135,6 +177,19 @@ class ProbabilityVectorSettingTest(unittest.TestCase):
         }
 
         validate_config(config)
+
+    def test_probability_vector_config_rejects_repeated_evaluation_vectors(self):
+        config = make_config()
+        config["data"]["type"] = "dirichlet_zipf_binary_probability_vector"
+        config["model"] = {
+            "type": "probability_mlp",
+            "vocab_size": 7,
+            "num_classes": 2,
+        }
+        config["evaluation"]["seqs_per_distribution"] = 2
+
+        with self.assertRaisesRegex(ValueError, "must be 1"):
+            validate_config(config)
 
     def test_probability_vector_data_requires_probability_model(self):
         config = make_config()

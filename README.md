@@ -25,3 +25,9 @@ With `training.compile: true`, the complete parameter update (zeroing gradients,
 forward and loss, backward, optional clipping, and optimizer step) is compiled
 as one function. Set it to `false` for short runs, debugging, or environments
 where `torch.compile` is unsupported.
+
+Evaluation uses a linear stride by default (`evaluation.spacing: linear` and
+`evaluation.interval`). To evaluate on a logarithmic schedule instead, set
+`evaluation.spacing: logarithmic` and `evaluation.points_per_decade` to the
+desired number of evaluations per factor of ten in training iterations. The
+logarithmic schedule always includes iterations 1 and `training.max_iters`.

@@ -39,8 +39,8 @@ training:
   grad_clip_norm:
 
 evaluation:
+  spacing: linear
   interval: 500
   seed: 12345
   num_distributions: 10000
-  seqs_per_distribution: 1
   microbatch_size: 10000
