@@ -5,7 +5,7 @@ from pathlib import Path
 import yaml
 
 
-# Sweep configuration. Paths in the same tuple are assigned the same value.
+# Sweep configuration. Use a string for one path or a tuple for coupled paths.
 REFERENCE_CONFIG = Path("sample_configs/distribution_classifier.yaml")
 OUTPUT_DIR = Path("configs/sweeps")
 SWEEP = [
@@ -43,7 +43,10 @@ def main():
     reference = load_yaml(REFERENCE_CONFIG)
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    path_groups = [paths for paths, _ in SWEEP]
+    path_groups = [
+        (paths,) if isinstance(paths, str) else paths
+        for paths, _ in SWEEP
+    ]
     value_lists = [values for _, values in SWEEP]
     for index, values in enumerate(itertools.product(*value_lists)):
         config = copy.deepcopy(reference)
@@ -57,9 +60,11 @@ def main():
 
         suffix = "__".join(
             f"{'-'.join(path.replace('.', '-') for path in paths)}-{slug(value)}"
-            for paths, value in zip(path_groups, values)
+            for paths, value, sweep_values in zip(path_groups, values, value_lists)
+            if len(sweep_values) > 1
         )
-        output_path = OUTPUT_DIR / f"{index:04d}_{suffix}.yaml"
+        filename = f"{index:04d}_{suffix}.yaml" if suffix else f"{index:04d}.yaml"
+        output_path = OUTPUT_DIR / filename
         if output_path.exists() and not OVERWRITE:
             raise FileExistsError(f"{output_path} exists; set OVERWRITE = True to replace it")
         with output_path.open("w", encoding="utf-8") as f:
