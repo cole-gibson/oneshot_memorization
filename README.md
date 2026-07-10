@@ -17,21 +17,7 @@ The current focus is sequence classification.
 The workbooks use Bayes optimal classification baselines in `base/bit_sequences.py`
 and `base/estimators.py`.
 
-## Training benchmarks
-
-`base.train_distribution_classifier` supports an optional `benchmark` config
-section. When enabled on CPU or CUDA, it writes aggregated initialization,
-training-step, evaluation, and checkpoint phase measurements to `timing.csv` in
-the run directory. `warmup_iters` and `measure_iters` select one steady-state
-training window relative to the start (or resume point) of the invocation.
-
-CUDA computational timings use events on the current stream. They measure GPU
-execution time and exclude Python dispatch overhead; `training_step_total`
-provides the aggregate device time for the measured training steps. CPU and
-host-I/O timings use wall time. Benchmark mode is unsupported on MPS.
-
 With `training.compile: true`, the complete parameter update (zeroing gradients,
 forward and loss, backward, optional clipping, and optimizer step) is compiled
-as one function. Its steady-state time is reported as `compiled_training_update`;
-the corresponding eager-only subphase rows have zero calls because compiled
-kernel work cannot be attributed to them without breaking the compiled region.
+as one function. Set it to `false` for short runs, debugging, or environments
+where `torch.compile` is unsupported.

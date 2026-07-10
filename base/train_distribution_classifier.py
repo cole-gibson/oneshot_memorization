@@ -1,10 +1,7 @@
 import argparse
 import contextlib
-import csv
 import random
 import time
-from collections import defaultdict
-from contextlib import contextmanager
 from pathlib import Path
 
 import numpy as np
@@ -34,179 +31,6 @@ DATA_TYPES = {
     "dirichlet_zipf_binary": DirichletZipfBinaryClassificationGenerator,
 }
 
-TRAINING_PHASES = (
-    "data_sample",
-    "label_and_count_bookkeeping",
-    "zero_grad",
-    "forward_and_loss",
-    "backward",
-    "grad_unscale_and_clip",
-    "optimizer_step_and_scaler_update",
-    "compiled_training_update",
-    "training_step_total",
-)
-
-TIMING_PHASES = TRAINING_PHASES + (
-    "train_logging_and_reporting",
-    "evaluation_forward",
-    "evaluation_aggregation",
-    "evaluation_csv_write",
-    "checkpoint_numbered",
-    "checkpoint_latest",
-    "data_generator_init",
-    "model_and_optimizer_init",
-    "resume_restore",
-    "eval_batch_init",
-    "compile_first_step",
-)
-
-TIMING_FIELDS = (
-    "start_iter",
-    "end_iter",
-    "phase",
-    "backend",
-    "num_calls",
-    "num_examples",
-    "total_ms",
-    "mean_ms",
-    "fraction_of_step",
-)
-
-
-class PhaseTimingCollector:
-    """Aggregate CPU wall times or asynchronous CUDA event timings."""
-
-    def __init__(self, enabled, device, path, measure_start, measure_end):
-        self.enabled = enabled
-        self.device = device
-        self.path = path
-        self.measure_start = measure_start
-        self.measure_end = measure_end
-        self.records = defaultdict(
-            lambda: {
-                "total_ms": 0.0,
-                "num_calls": 0,
-                "num_examples": 0,
-                "start_iter": None,
-                "end_iter": None,
-                "backends": set(),
-            }
-        )
-        self.pending_cuda = []
-
-    def is_training_iteration(self, iteration):
-        return (
-            self.enabled
-            and self.measure_start <= iteration <= self.measure_end
-        )
-
-    def _add(self, phase, elapsed_ms, iteration, num_examples, backend):
-        record = self.records[phase]
-        record["total_ms"] += elapsed_ms
-        record["num_calls"] += 1
-        record["num_examples"] += num_examples
-        record["backends"].add(backend)
-        if iteration is not None:
-            if record["start_iter"] is None:
-                record["start_iter"] = iteration
-            record["start_iter"] = min(record["start_iter"], iteration)
-            record["end_iter"] = max(record["end_iter"] or iteration, iteration)
-
-    def add_wall_time(self, phase, elapsed_ms, iteration, num_examples=0):
-        if self.enabled:
-            self._add(phase, elapsed_ms, iteration, num_examples, "wall")
-
-    @contextmanager
-    def phase(
-        self,
-        phase,
-        iteration=None,
-        num_examples=0,
-        use_cuda_events=False,
-        synchronize_cuda=False,
-        active=True,
-    ):
-        if not self.enabled or not active:
-            yield
-            return
-        if use_cuda_events and self.device.type == "cuda":
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            start.record()
-            try:
-                yield
-            finally:
-                end.record()
-                self.pending_cuda.append(
-                    (phase, start, end, iteration, num_examples)
-                )
-            return
-
-        if synchronize_cuda and self.device.type == "cuda":
-            torch.cuda.synchronize(self.device)
-        start_ns = time.perf_counter_ns()
-        try:
-            yield
-        finally:
-            if synchronize_cuda and self.device.type == "cuda":
-                torch.cuda.synchronize(self.device)
-            elapsed_ms = (time.perf_counter_ns() - start_ns) / 1_000_000
-            self._add(phase, elapsed_ms, iteration, num_examples, "wall")
-
-    def resolve_cuda(self):
-        if not self.pending_cuda:
-            return
-        torch.cuda.synchronize(self.device)
-        for phase, start, end, iteration, num_examples in self.pending_cuda:
-            self._add(
-                phase,
-                start.elapsed_time(end),
-                iteration,
-                num_examples,
-                "cuda_event",
-            )
-        self.pending_cuda.clear()
-
-    def write(self):
-        if not self.enabled:
-            return
-        self.resolve_cuda()
-        step_total = self.records["training_step_total"]["total_ms"]
-        rows = []
-        for phase in TIMING_PHASES:
-            record = self.records[phase]
-            calls = record["num_calls"]
-            start_iter = record["start_iter"]
-            end_iter = record["end_iter"]
-            if phase in TRAINING_PHASES and start_iter is None:
-                start_iter = self.measure_start
-                end_iter = self.measure_end
-            fraction = ""
-            if phase in TRAINING_PHASES and step_total > 0:
-                fraction = f'{record["total_ms"] / step_total:.8f}'
-            rows.append(
-                {
-                    "start_iter": "" if start_iter is None else start_iter,
-                    "end_iter": "" if end_iter is None else end_iter,
-                    "phase": phase,
-                    "backend": "+".join(sorted(record["backends"])),
-                    "num_calls": calls,
-                    "num_examples": record["num_examples"],
-                    "total_ms": f'{record["total_ms"]:.6f}',
-                    "mean_ms": (
-                        f'{record["total_ms"] / calls:.6f}' if calls else ""
-                    ),
-                    "fraction_of_step": fraction,
-                }
-            )
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        file_exists = self.path.exists()
-        with self.path.open("a", newline="", encoding="utf-8") as file:
-            writer = csv.DictWriter(file, fieldnames=TIMING_FIELDS)
-            if not file_exists:
-                writer.writeheader()
-            writer.writerows(rows)
-
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Train a distribution-label classifier.")
@@ -218,21 +42,6 @@ def parse_args():
 
 def resolve_device(name):
     return resolve_device_base(name, prefer_mps=True)
-
-
-def validate_benchmark_run(config, device, start_iter):
-    benchmark = config.get("benchmark", {})
-    if not benchmark.get("enabled", False):
-        return
-    if device.type == "mps":
-        raise ValueError("benchmark mode supports CPU and CUDA, not MPS")
-    warmup_iters = benchmark.get("warmup_iters", 50)
-    measure_iters = benchmark.get("measure_iters", 200)
-    remaining_iters = int(config["training"]["max_iters"]) - start_iter
-    if warmup_iters + measure_iters > remaining_iters:
-        raise ValueError(
-            "benchmark warm-up and measurement window exceed remaining iterations"
-        )
 
 
 def validate_config(config):
@@ -273,22 +82,6 @@ def validate_config(config):
     amp_dtype = training.get("amp_dtype")
     if amp_dtype not in (None, "bf16", "fp16"):
         raise ValueError("training.amp_dtype must be one of null, 'bf16', or 'fp16'")
-    benchmark = config.get("benchmark", {})
-    if not isinstance(benchmark, dict):
-        raise ValueError("benchmark must be a mapping")
-    if not isinstance(benchmark.get("enabled", False), bool):
-        raise ValueError("benchmark.enabled must be a boolean")
-    if benchmark.get("enabled", False):
-        warmup_iters = benchmark.get("warmup_iters", 50)
-        measure_iters = benchmark.get("measure_iters", 200)
-        if type(warmup_iters) is not int or warmup_iters < 0:
-            raise ValueError("benchmark.warmup_iters must be a nonnegative integer")
-        if type(measure_iters) is not int or measure_iters < 1:
-            raise ValueError("benchmark.measure_iters must be a positive integer")
-        if training.get("compile", False) and warmup_iters < 1:
-            raise ValueError(
-                "compiled benchmark runs require at least one warm-up iteration"
-            )
 
 
 def build_data_generator(config, device, generator, checkpoint=None):
@@ -492,65 +285,49 @@ def evaluate(
     log_path,
     iteration,
     amp_dtype,
-    timing=None,
 ):
     model.eval()
     tokens = eval_batch["tokens"]
     labels = eval_batch["labels"]
     ids = eval_batch["distribution_ids"]
-    timing = timing or PhaseTimingCollector(False, tokens.device, None, 0, 0)
-    num_examples = ids.numel()
-    with timing.phase(
-        "evaluation_forward",
-        iteration,
-        num_examples,
-        use_cuda_events=True,
-    ):
-        losses = []
-        microbatch = config["evaluation"].get("microbatch_size", ids.numel())
-        for start in range(0, ids.numel(), microbatch):
-            stop = min(start + microbatch, ids.numel())
-            with autocast_context(tokens.device, amp_dtype):
-                logits = model(tokens[start:stop])["logits"]
-                losses.append(
-                    F.cross_entropy(logits, labels[start:stop], reduction="none")
-                )
-        losses = torch.cat(losses)
-    with timing.phase(
-        "evaluation_aggregation",
-        iteration,
-        num_examples,
-        use_cuda_events=True,
-    ):
-        num_distributions = int(ids.max().item()) + 1
-        loss_sums = torch.zeros(
-            num_distributions, device=losses.device, dtype=losses.dtype
-        )
-        loss_sums.scatter_add_(0, ids, losses)
-        loss_counts = torch.bincount(ids, minlength=num_distributions).clamp_min(1)
-        mean_losses = (loss_sums / loss_counts.to(losses.dtype)).cpu()
-        labels_cpu = data_generator.distribution_labels[:num_distributions].cpu()
-        counts_cpu = presentation_counts[:num_distributions].cpu()
+    losses = []
+    microbatch = config["evaluation"].get("microbatch_size", ids.numel())
+    for start in range(0, ids.numel(), microbatch):
+        stop = min(start + microbatch, ids.numel())
+        with autocast_context(tokens.device, amp_dtype):
+            logits = model(tokens[start:stop])["logits"]
+            losses.append(
+                F.cross_entropy(logits, labels[start:stop], reduction="none")
+            )
+    losses = torch.cat(losses)
+    num_distributions = int(ids.max().item()) + 1
+    loss_sums = torch.zeros(
+        num_distributions, device=losses.device, dtype=losses.dtype
+    )
+    loss_sums.scatter_add_(0, ids, losses)
+    loss_counts = torch.bincount(ids, minlength=num_distributions).clamp_min(1)
+    mean_losses = (loss_sums / loss_counts.to(losses.dtype)).cpu()
+    labels_cpu = data_generator.distribution_labels[:num_distributions].cpu()
+    counts_cpu = presentation_counts[:num_distributions].cpu()
 
-    with timing.phase("evaluation_csv_write", iteration, num_examples):
-        fieldnames = [
-            "iter",
-            "distribution_id",
-            "label",
-            "loss",
-            "training_seen_count",
-        ]
-        rows = [
-            {
-                "iter": iteration,
-                "distribution_id": distribution_id,
-                "label": int(labels_cpu[distribution_id].item()),
-                "loss": f"{mean_losses[distribution_id].item():.8f}",
-                "training_seen_count": int(counts_cpu[distribution_id].item()),
-            }
-            for distribution_id in range(num_distributions)
-        ]
-        append_csv_rows(log_path, fieldnames, rows)
+    fieldnames = [
+        "iter",
+        "distribution_id",
+        "label",
+        "loss",
+        "training_seen_count",
+    ]
+    rows = [
+        {
+            "iter": iteration,
+            "distribution_id": distribution_id,
+            "label": int(labels_cpu[distribution_id].item()),
+            "loss": f"{mean_losses[distribution_id].item():.8f}",
+            "training_seen_count": int(counts_cpu[distribution_id].item()),
+        }
+        for distribution_id in range(num_distributions)
+    ]
+    append_csv_rows(log_path, fieldnames, rows)
     model.train()
 
 
@@ -583,10 +360,7 @@ def main():
     seed = int(config["seed"])
     seed_everything(seed)
     device = resolve_device(config.get("device", "auto"))
-    benchmark = config.get("benchmark", {})
-    benchmark_enabled = benchmark.get("enabled", False)
     start_iter = 0 if checkpoint is None else int(checkpoint["iteration"])
-    validate_benchmark_run(config, device, start_iter)
     train_generator = make_torch_generator(device, seed)
     eval_generator = make_torch_generator(
         device,
@@ -600,27 +374,9 @@ def main():
         with (run_dir / "config.yaml").open("w", encoding="utf-8") as f:
             yaml.safe_dump(config, f, sort_keys=False)
 
-    warmup_iters = benchmark.get("warmup_iters", 50)
-    measure_iters = benchmark.get("measure_iters", 200)
-    measure_start = start_iter + warmup_iters + 1
-    measure_end = start_iter + warmup_iters + measure_iters
-    timing = PhaseTimingCollector(
-        benchmark_enabled,
-        device,
-        run_dir / "timing.csv",
-        measure_start,
-        measure_end,
-    )
-
-    with timing.phase("data_generator_init", start_iter, synchronize_cuda=True):
-        data_generator = build_data_generator(
-            config, device, train_generator, checkpoint
-        )
-    with timing.phase(
-        "model_and_optimizer_init", start_iter, synchronize_cuda=True
-    ):
-        model = build_model(config).to(device)
-        optimizer = build_optimizer(model, config, device)
+    data_generator = build_data_generator(config, device, train_generator, checkpoint)
+    model = build_model(config).to(device)
+    optimizer = build_optimizer(model, config, device)
     amp_dtype = resolve_amp_dtype(config, device)
     grad_scaler = make_grad_scaler(config, device)
     presentation_counts = torch.zeros(
@@ -629,18 +385,16 @@ def main():
         device=device,
     )
     if checkpoint is not None:
-        with timing.phase("resume_restore", start_iter, synchronize_cuda=True):
-            model.load_state_dict(checkpoint["model_state"])
-            optimizer.load_state_dict(checkpoint["optimizer_state"])
-            presentation_counts = checkpoint["presentation_counts"].to(
-                device=device,
-                dtype=torch.long,
-            )
-            set_rng_state(checkpoint.get("rng_state"), train_generator)
-            eval_batch = move_eval_batch(checkpoint["eval_batch"], device)
+        model.load_state_dict(checkpoint["model_state"])
+        optimizer.load_state_dict(checkpoint["optimizer_state"])
+        presentation_counts = checkpoint["presentation_counts"].to(
+            device=device,
+            dtype=torch.long,
+        )
+        set_rng_state(checkpoint.get("rng_state"), train_generator)
+        eval_batch = move_eval_batch(checkpoint["eval_batch"], device)
     else:
-        with timing.phase("eval_batch_init", start_iter, synchronize_cuda=True):
-            eval_batch = make_eval_batch(data_generator, config, eval_generator)
+        eval_batch = make_eval_batch(data_generator, config, eval_generator)
 
     compile_training = config["training"].get("compile", False)
     compiled_training_step = None
@@ -671,151 +425,36 @@ def main():
     model.train()
     for iteration in range(start_iter + 1, max_iters + 1):
         batch_size = config["data"]["batch_size"]
-        measure_iteration = False
-        if not benchmark_enabled:
-            tokens, distribution_ids, binary_labels = data_generator.sample(
-                batch_size=batch_size,
-                sequence_length=config["data"]["sequence_length"],
-                return_distribution_ids=True,
-                return_labels=True,
-            )
-            labels = (
-                distribution_ids
-                if config["data"].get("label_scheme", "binary") == "identity"
-                else binary_labels
-            )
-            presentation_counts += torch.bincount(
-                distribution_ids,
-                minlength=config["data"]["num_distributions"],
-            )
-            if compile_training:
-                loss = compiled_training_step(tokens, labels)
-            else:
-                optimizer.zero_grad(set_to_none=True)
-                with autocast_context(device, amp_dtype):
-                    loss = model(tokens, targets=labels)["loss"]
-                grad_scaler.scale(loss).backward()
-                if config["training"].get("grad_clip_norm") is not None:
-                    grad_scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(
-                        model.parameters(),
-                        float(config["training"]["grad_clip_norm"]),
-                    )
-                grad_scaler.step(optimizer)
-                grad_scaler.update()
+        tokens, distribution_ids, binary_labels = data_generator.sample(
+            batch_size=batch_size,
+            sequence_length=config["data"]["sequence_length"],
+            return_distribution_ids=True,
+            return_labels=True,
+        )
+        labels = (
+            distribution_ids
+            if config["data"].get("label_scheme", "binary") == "identity"
+            else binary_labels
+        )
+        presentation_counts += torch.bincount(
+            distribution_ids,
+            minlength=config["data"]["num_distributions"],
+        )
+        if compile_training:
+            loss = compiled_training_step(tokens, labels)
         else:
-            measure_iteration = timing.is_training_iteration(iteration)
-            compile_first = (
-                compile_training and iteration == start_iter + 1
-            )
-            if compile_first and device.type == "cuda":
-                torch.cuda.synchronize(device)
-            compile_start_ns = time.perf_counter_ns() if compile_first else None
-            with timing.phase(
-                "training_step_total",
-                iteration,
-                batch_size,
-                use_cuda_events=True,
-                active=measure_iteration,
-            ):
-                with timing.phase(
-                    "data_sample",
-                    iteration,
-                    batch_size,
-                    use_cuda_events=True,
-                    active=measure_iteration,
-                ):
-                    tokens, distribution_ids, binary_labels = data_generator.sample(
-                        batch_size=batch_size,
-                        sequence_length=config["data"]["sequence_length"],
-                        return_distribution_ids=True,
-                        return_labels=True,
-                    )
-                with timing.phase(
-                    "label_and_count_bookkeeping",
-                    iteration,
-                    batch_size,
-                    use_cuda_events=True,
-                    active=measure_iteration,
-                ):
-                    labels = (
-                        distribution_ids
-                        if config["data"].get("label_scheme", "binary") == "identity"
-                        else binary_labels
-                    )
-                    presentation_counts += torch.bincount(
-                        distribution_ids,
-                        minlength=config["data"]["num_distributions"],
-                    )
-
-                if compile_training:
-                    with timing.phase(
-                        "compiled_training_update",
-                        iteration,
-                        batch_size,
-                        use_cuda_events=True,
-                        active=measure_iteration,
-                    ):
-                        loss = compiled_training_step(tokens, labels)
-                else:
-                    with timing.phase(
-                        "zero_grad",
-                        iteration,
-                        batch_size,
-                        use_cuda_events=True,
-                        active=measure_iteration,
-                    ):
-                        optimizer.zero_grad(set_to_none=True)
-                    with timing.phase(
-                        "forward_and_loss",
-                        iteration,
-                        batch_size,
-                        use_cuda_events=True,
-                        active=measure_iteration,
-                    ):
-                        with autocast_context(device, amp_dtype):
-                            loss = model(tokens, targets=labels)["loss"]
-                    with timing.phase(
-                        "backward",
-                        iteration,
-                        batch_size,
-                        use_cuda_events=True,
-                        active=measure_iteration,
-                    ):
-                        grad_scaler.scale(loss).backward()
-                    if config["training"].get("grad_clip_norm") is not None:
-                        with timing.phase(
-                            "grad_unscale_and_clip",
-                            iteration,
-                            batch_size,
-                            use_cuda_events=True,
-                            active=measure_iteration,
-                        ):
-                            grad_scaler.unscale_(optimizer)
-                            torch.nn.utils.clip_grad_norm_(
-                                model.parameters(),
-                                float(config["training"]["grad_clip_norm"]),
-                            )
-                    with timing.phase(
-                        "optimizer_step_and_scaler_update",
-                        iteration,
-                        batch_size,
-                        use_cuda_events=True,
-                        active=measure_iteration,
-                    ):
-                        grad_scaler.step(optimizer)
-                        grad_scaler.update()
-            if compile_first:
-                if device.type == "cuda":
-                    torch.cuda.synchronize(device)
-                timing.add_wall_time(
-                    "compile_first_step",
-                    (time.perf_counter_ns() - compile_start_ns) / 1_000_000,
-                    iteration,
-                    batch_size,
+            optimizer.zero_grad(set_to_none=True)
+            with autocast_context(device, amp_dtype):
+                loss = model(tokens, targets=labels)["loss"]
+            grad_scaler.scale(loss).backward()
+            if config["training"].get("grad_clip_norm") is not None:
+                grad_scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(
+                    model.parameters(),
+                    float(config["training"]["grad_clip_norm"]),
                 )
-            if measure_iteration and iteration == measure_end:
-                timing.resolve_cuda()
+            grad_scaler.step(optimizer)
+            grad_scaler.update()
 
         should_report = (
             iteration == start_iter + 1
@@ -831,42 +470,37 @@ def main():
             iteration % config["training"]["checkpoint_interval"] == 0
             or iteration == max_iters
         )
-        with timing.phase(
-            "train_logging_and_reporting",
-            iteration,
-            active=measure_iteration and (should_log_train or should_report),
-        ):
-            loss_value = None
-            if should_log_train or should_report or should_checkpoint:
-                loss_value = loss.item()
+        loss_value = None
+        if should_log_train or should_report or should_checkpoint:
+            loss_value = loss.item()
 
-            if should_log_train:
-                append_csv(
-                    train_log,
-                    ["iter", "loss", "lr", "time_sec"],
-                    {
-                        "iter": iteration,
-                        "loss": f"{loss_value:.8f}",
-                        "lr": optimizer.param_groups[0]["lr"],
-                        "time_sec": f"{time.perf_counter() - start_time:.4f}",
-                    },
-                )
-            if should_report:
-                now = time.perf_counter()
-                recent_iters = iteration - last_report_iter
-                recent_sec_per_iter = (now - last_report_time) / recent_iters
-                total_sec_per_iter = (now - start_time) / (iteration - start_iter)
-                eta = format_duration((max_iters - iteration) * total_sec_per_iter)
-                print(
-                    f"iter {iteration}/{max_iters} "
-                    f"loss {loss_value:.6f} "
-                    f"sec_per_iter {recent_sec_per_iter:.4f} "
-                    f"avg_sec_per_iter {total_sec_per_iter:.4f} "
-                    f"eta {eta}",
-                    flush=True,
-                )
-                last_report_time = now
-                last_report_iter = iteration
+        if should_log_train:
+            append_csv(
+                train_log,
+                ["iter", "loss", "lr", "time_sec"],
+                {
+                    "iter": iteration,
+                    "loss": f"{loss_value:.8f}",
+                    "lr": optimizer.param_groups[0]["lr"],
+                    "time_sec": f"{time.perf_counter() - start_time:.4f}",
+                },
+            )
+        if should_report:
+            now = time.perf_counter()
+            recent_iters = iteration - last_report_iter
+            recent_sec_per_iter = (now - last_report_time) / recent_iters
+            total_sec_per_iter = (now - start_time) / (iteration - start_iter)
+            eta = format_duration((max_iters - iteration) * total_sec_per_iter)
+            print(
+                f"iter {iteration}/{max_iters} "
+                f"loss {loss_value:.6f} "
+                f"sec_per_iter {recent_sec_per_iter:.4f} "
+                f"avg_sec_per_iter {total_sec_per_iter:.4f} "
+                f"eta {eta}",
+                flush=True,
+            )
+            last_report_time = now
+            last_report_iter = iteration
         if (
             iteration % config["evaluation"]["interval"] == 0
             or iteration == start_iter + 1
@@ -880,32 +514,26 @@ def main():
                 eval_log,
                 iteration,
                 amp_dtype,
-                timing,
             )
         if should_checkpoint:
-            for phase, path in (
-                (
-                    "checkpoint_numbered",
-                    checkpoint_dir / f"checkpoint_{iteration:06d}.pt",
-                ),
-                ("checkpoint_latest", checkpoint_dir / "latest.pt"),
+            for path in (
+                checkpoint_dir / f"checkpoint_{iteration:06d}.pt",
+                checkpoint_dir / "latest.pt",
             ):
-                with timing.phase(phase, iteration):
-                    save_checkpoint(
-                        path,
-                        model,
-                        optimizer,
-                        iteration,
-                        config,
-                        run_dir,
-                        data_generator,
-                        presentation_counts,
-                        train_generator,
-                        eval_batch,
-                    )
+                save_checkpoint(
+                    path,
+                    model,
+                    optimizer,
+                    iteration,
+                    config,
+                    run_dir,
+                    data_generator,
+                    presentation_counts,
+                    train_generator,
+                    eval_batch,
+                )
             print(f"checkpoint iter {iteration} loss {loss_value:.6f}", flush=True)
 
-    timing.write()
     print(f"run directory: {run_dir}")
 
 
