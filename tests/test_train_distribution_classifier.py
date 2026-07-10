@@ -3,7 +3,11 @@ from unittest import mock
 
 import torch
 
-from base.bit_sequences import SummarySequenceClassifierMLP
+from base.bit_sequences import (
+    ProbabilityVectorClassifierMLP,
+    SummarySequenceClassifierMLP,
+)
+from base.data_generator import DirichletZipfBinaryProbabilityVectorGenerator
 from base.train_distribution_classifier import (
     make_compiled_training_step,
     validate_config,
@@ -79,6 +83,65 @@ class CompiledTrainingStepTest(unittest.TestCase):
                 for old, new in zip(before, model.parameters())
             )
         )
+
+
+class ProbabilityVectorSettingTest(unittest.TestCase):
+    def test_generator_returns_selected_probability_vectors_and_labels(self):
+        distributions = torch.tensor([[0.8, 0.2], [0.1, 0.9]])
+        labels = torch.tensor([1, 0])
+        generator = DirichletZipfBinaryProbabilityVectorGenerator(
+            num_distributions=2,
+            num_states=2,
+            alpha=1.0,
+            zipf_exponent=0.0,
+            distributions=distributions,
+            distribution_labels=labels,
+        )
+
+        probabilities, distribution_ids, sampled_labels = (
+            generator.sample(
+                batch_size=8,
+                return_distribution_ids=True,
+                return_labels=True,
+            )
+        )
+
+        torch.testing.assert_close(probabilities, distributions[distribution_ids])
+        torch.testing.assert_close(sampled_labels, labels[distribution_ids])
+
+    def test_model_uses_probability_weighted_state_embedding(self):
+        model = ProbabilityVectorClassifierMLP(
+            vocab_size=3,
+            num_classes=2,
+            embed_dim=4,
+            mlp_num_layers=0,
+        )
+        probabilities = torch.tensor([[0.2, 0.3, 0.5]])
+
+        result = model(probabilities)
+        expected_embedding = probabilities @ model.state_embedding
+        expected_logits = model.mlp(model.input_layer_norm(expected_embedding))
+
+        torch.testing.assert_close(result["logits"], expected_logits)
+
+    def test_probability_vector_config_does_not_require_sequence_length(self):
+        config = make_config()
+        config["data"]["type"] = "dirichlet_zipf_binary_probability_vector"
+        config["data"].pop("sequence_length")
+        config["model"] = {
+            "type": "probability_mlp",
+            "vocab_size": 7,
+            "num_classes": 2,
+        }
+
+        validate_config(config)
+
+    def test_probability_vector_data_requires_probability_model(self):
+        config = make_config()
+        config["data"]["type"] = "dirichlet_zipf_binary_probability_vector"
+
+        with self.assertRaisesRegex(ValueError, "requires model.type"):
+            validate_config(config)
 
 
 if __name__ == "__main__":

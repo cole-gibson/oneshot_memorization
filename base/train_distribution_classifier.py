@@ -9,8 +9,14 @@ import torch
 import torch.nn.functional as F
 import yaml
 
-from base.bit_sequences import SummarySequenceClassifierMLP
-from base.data_generator import DirichletZipfBinaryClassificationGenerator
+from base.bit_sequences import (
+    ProbabilityVectorClassifierMLP,
+    SummarySequenceClassifierMLP,
+)
+from base.data_generator import (
+    DirichletZipfBinaryClassificationGenerator,
+    DirichletZipfBinaryProbabilityVectorGenerator,
+)
 from base.training_utils import (
     append_csv,
     append_csv_rows,
@@ -24,12 +30,18 @@ from base.training_utils import (
 
 
 MODEL_TYPES = {
+    "probability_mlp": ProbabilityVectorClassifierMLP,
     "summary_mlp": SummarySequenceClassifierMLP,
 }
 
 DATA_TYPES = {
     "dirichlet_zipf_binary": DirichletZipfBinaryClassificationGenerator,
+    "dirichlet_zipf_binary_probability_vector": (
+        DirichletZipfBinaryProbabilityVectorGenerator
+    ),
 }
+
+PROBABILITY_VECTOR_DATA_TYPE = "dirichlet_zipf_binary_probability_vector"
 
 
 def parse_args():
@@ -54,9 +66,21 @@ def validate_config(config):
         raise ValueError(f"unknown model.type {model.get('type')!r}")
     if data.get("type") not in DATA_TYPES:
         raise ValueError(f"unknown data.type {data.get('type')!r}")
+    is_probability_vector = data["type"] == PROBABILITY_VECTOR_DATA_TYPE
+    expected_model_type = (
+        "probability_mlp" if is_probability_vector else "summary_mlp"
+    )
+    if model["type"] != expected_model_type:
+        raise ValueError(
+            f"data.type {data['type']!r} requires model.type "
+            f"{expected_model_type!r}"
+        )
     if model["vocab_size"] != data["num_states"]:
         raise ValueError("model.vocab_size must equal data.num_states")
-    if model["sequence_length"] != data["sequence_length"]:
+    if (
+        not is_probability_vector
+        and model["sequence_length"] != data["sequence_length"]
+    ):
         raise ValueError("model.sequence_length must equal data.sequence_length")
     label_scheme = data.get("label_scheme", "binary")
     if label_scheme not in ("binary", "identity"):
@@ -88,7 +112,7 @@ def build_data_generator(config, device, generator, checkpoint=None):
     data = dict(config["data"])
     data.pop("type")
     data.pop("label_scheme", None)
-    data.pop("sequence_length")
+    data.pop("sequence_length", None)
     data.pop("batch_size")
     if checkpoint is not None:
         data["distributions"] = checkpoint["distributions"].to(device)
@@ -257,22 +281,29 @@ def make_eval_batch(data_generator, config, eval_generator):
     ids = torch.arange(num_distributions, device=data_generator.device)
     ids = ids.repeat_interleave(seqs_per_distribution)
 
-    train_generator = data_generator.generator
-    data_generator.generator = eval_generator
-    try:
-        tokens, binary_labels = data_generator.sample_from_distribution_ids(
+    if config["data"]["type"] == PROBABILITY_VECTOR_DATA_TYPE:
+        inputs, binary_labels = data_generator.sample_from_distribution_ids(
             ids,
-            sequence_length=config["data"]["sequence_length"],
             return_labels=True,
         )
-    finally:
-        data_generator.generator = train_generator
+    else:
+        train_generator = data_generator.generator
+        data_generator.generator = eval_generator
+        try:
+            inputs, binary_labels = data_generator.sample_from_distribution_ids(
+                ids,
+                sequence_length=config["data"]["sequence_length"],
+                return_labels=True,
+            )
+        finally:
+            data_generator.generator = train_generator
     labels = (
         ids
         if config["data"].get("label_scheme", "binary") == "identity"
         else binary_labels
     )
-    return {"tokens": tokens, "labels": labels, "distribution_ids": ids}
+    # Keep the existing checkpoint key for backward-compatible resume behavior.
+    return {"tokens": inputs, "labels": labels, "distribution_ids": ids}
 
 
 @torch.no_grad()
@@ -287,15 +318,15 @@ def evaluate(
     amp_dtype,
 ):
     model.eval()
-    tokens = eval_batch["tokens"]
+    inputs = eval_batch["tokens"]
     labels = eval_batch["labels"]
     ids = eval_batch["distribution_ids"]
     losses = []
     microbatch = config["evaluation"].get("microbatch_size", ids.numel())
     for start in range(0, ids.numel(), microbatch):
         stop = min(start + microbatch, ids.numel())
-        with autocast_context(tokens.device, amp_dtype):
-            logits = model(tokens[start:stop])["logits"]
+        with autocast_context(inputs.device, amp_dtype):
+            logits = model(inputs[start:stop])["logits"]
             losses.append(
                 F.cross_entropy(logits, labels[start:stop], reduction="none")
             )
@@ -425,12 +456,19 @@ def main():
     model.train()
     for iteration in range(start_iter + 1, max_iters + 1):
         batch_size = config["data"]["batch_size"]
-        tokens, distribution_ids, binary_labels = data_generator.sample(
-            batch_size=batch_size,
-            sequence_length=config["data"]["sequence_length"],
-            return_distribution_ids=True,
-            return_labels=True,
-        )
+        if config["data"]["type"] == PROBABILITY_VECTOR_DATA_TYPE:
+            inputs, distribution_ids, binary_labels = data_generator.sample(
+                batch_size=batch_size,
+                return_distribution_ids=True,
+                return_labels=True,
+            )
+        else:
+            inputs, distribution_ids, binary_labels = data_generator.sample(
+                batch_size=batch_size,
+                sequence_length=config["data"]["sequence_length"],
+                return_distribution_ids=True,
+                return_labels=True,
+            )
         labels = (
             distribution_ids
             if config["data"].get("label_scheme", "binary") == "identity"
@@ -441,11 +479,11 @@ def main():
             minlength=config["data"]["num_distributions"],
         )
         if compile_training:
-            loss = compiled_training_step(tokens, labels)
+            loss = compiled_training_step(inputs, labels)
         else:
             optimizer.zero_grad(set_to_none=True)
             with autocast_context(device, amp_dtype):
-                loss = model(tokens, targets=labels)["loss"]
+                loss = model(inputs, targets=labels)["loss"]
             grad_scaler.scale(loss).backward()
             if config["training"].get("grad_clip_norm") is not None:
                 grad_scaler.unscale_(optimizer)

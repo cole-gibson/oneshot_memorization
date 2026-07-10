@@ -321,3 +321,58 @@ class SummarySequenceClassifierMLP(nn.Module):
         if targets is not None:
             loss = F.cross_entropy(logits, targets)
         return {"logits": logits, "loss": loss}
+
+
+class ProbabilityVectorClassifierMLP(nn.Module):
+    """Classify a categorical probability vector via its expected embedding."""
+
+    def __init__(
+        self,
+        vocab_size,
+        num_classes,
+        embed_dim=256,
+        mlp_ratio=4,
+        mlp_num_layers=2,
+        dropout=0.0,
+    ):
+        super().__init__()
+        if vocab_size < 1:
+            raise ValueError("vocab_size must be at least 1")
+        if num_classes < 1:
+            raise ValueError("num_classes must be at least 1")
+        if mlp_num_layers < 0:
+            raise ValueError("mlp_num_layers must be nonnegative")
+
+        self.vocab_size = vocab_size
+        self.embed_dim = embed_dim
+        self.init_std = embed_dim**-0.5
+        self.state_embedding = nn.Parameter(torch.empty(vocab_size, embed_dim))
+        self.input_layer_norm = nn.LayerNorm(embed_dim, elementwise_affine=False)
+        self.mlp = make_mlp(
+            input_dim=embed_dim,
+            output_dim=num_classes,
+            hidden_dim=mlp_ratio * embed_dim,
+            num_hidden_layers=mlp_num_layers,
+            dropout=dropout,
+        )
+        nn.init.normal_(self.state_embedding, mean=0.0, std=self.init_std)
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            nn.init.normal_(module.weight, mean=0.0, std=self.init_std)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+
+    def forward(self, probabilities, targets=None):
+        if probabilities.ndim != 2 or probabilities.shape[1] != self.vocab_size:
+            raise ValueError(
+                "probabilities must have shape (batch_size, vocab_size)"
+            )
+        x = probabilities.to(dtype=self.state_embedding.dtype) @ self.state_embedding
+        x = self.input_layer_norm(x)
+        logits = self.mlp(x)
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits, targets)
+        return {"logits": logits, "loss": loss}

@@ -264,6 +264,68 @@ class DirichletZipfBinaryClassificationGenerator(DirichletZipfSequenceGenerator)
         return self
 
 
+class DirichletZipfBinaryProbabilityVectorGenerator(
+    DirichletZipfBinaryClassificationGenerator
+):
+    """Generate probability-vector/label pairs from Zipf-selected components."""
+
+    @torch.no_grad()
+    def sample(
+        self,
+        batch_size,
+        return_distribution_ids=False,
+        return_labels=False,
+    ):
+        if batch_size < 1:
+            raise ValueError("batch_size must be at least 1")
+
+        distribution_ids = torch.multinomial(
+            self.distribution_weights,
+            num_samples=batch_size,
+            replacement=True,
+            generator=self.generator,
+        )
+        probabilities = self.distributions[distribution_ids]
+        labels = self.distribution_labels[distribution_ids]
+
+        if return_distribution_ids and return_labels:
+            return probabilities, distribution_ids, labels
+        if return_distribution_ids:
+            return probabilities, distribution_ids
+        if return_labels:
+            return probabilities, labels
+        return probabilities
+
+    @torch.no_grad()
+    def sample_from_distribution_ids(
+        self,
+        distribution_ids,
+        return_labels=False,
+    ):
+        distribution_ids = torch.as_tensor(distribution_ids, device=self.device)
+        if distribution_ids.ndim != 1:
+            raise ValueError("distribution_ids must have shape (batch_size,)")
+        if distribution_ids.numel() == 0:
+            raise ValueError("distribution_ids must contain at least one id")
+        if torch.is_floating_point(distribution_ids):
+            if not torch.all(distribution_ids == distribution_ids.long()):
+                raise ValueError("distribution_ids must contain integer ids")
+        distribution_ids = distribution_ids.to(dtype=torch.long)
+        if (
+            distribution_ids.min() < 0
+            or distribution_ids.max() >= self.num_distributions
+        ):
+            raise ValueError(
+                "distribution_ids contain ids outside "
+                f"[0, {self.num_distributions})"
+            )
+
+        probabilities = self.distributions[distribution_ids]
+        if return_labels:
+            return probabilities, self.distribution_labels[distribution_ids]
+        return probabilities
+
+
 if __name__ == "__main__":
     generator = DirichletZipfSequenceGenerator(
         num_distributions=100,

@@ -6,9 +6,13 @@ Numerical experiments for one-shot memorization.
 
 The current focus is sequence classification.
 
-- `base.train_distribution_classifier` trains a summary embedding MLP to
-  classify sampled Dirichlet-Zipf state sequences using either random binary
-  labels or distribution identity labels.
+- `base.train_distribution_classifier` trains an embedding MLP to classify
+  Dirichlet-Zipf components using either random binary labels or distribution
+  identity labels. Use `data.type: dirichlet_zipf_binary` with
+  `model.type: summary_mlp` to classify sampled state sequences, or use
+  `data.type: dirichlet_zipf_binary_probability_vector` with
+  `model.type: probability_mlp` to classify component probability vectors
+  directly.
 - `workbooks/train_distribution_label_classifier.py` explores the same
   distribution-based sequence classification task interactively.
 - `workbooks/train_bit_sequence_classifier.py` trains an MLP to classify fixed
