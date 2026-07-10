@@ -4,7 +4,7 @@ Numerical experiments for one-shot memorization.
 
 ## Experiment settings
 
-The current focus is sequence classification.
+The current focus is classification under Zipf-distributed task frequencies.
 
 - `base.train_distribution_classifier` trains an embedding MLP to classify
   Dirichlet-Zipf components using either random binary labels or distribution
@@ -13,10 +13,23 @@ The current focus is sequence classification.
   `data.type: dirichlet_zipf_binary_probability_vector` with
   `model.type: probability_mlp` to classify component probability vectors
   directly.
+- The same trainer accepts `data.type: zipf_bit_binary` with
+  `model.type: bit_sequence_mlp`. This setting samples a fixed collection of
+  unique N-bit vectors from a Zipf prior and predicts their random binary labels.
+  The model sends signed bits directly through an MLP.
 - `workbooks/train_distribution_label_classifier.py` explores the same
   distribution-based sequence classification task interactively.
 - `workbooks/train_bit_sequence_classifier.py` trains an MLP to classify fixed
-  binary sequences using either random binary labels or sequence identity labels.
+  binary sequences interactively.
+
+Runnable examples are provided in `sample_configs/distribution_classifier.yaml`,
+`sample_configs/distribution_vector_classifier.yaml`, and
+`sample_configs/bit_sequence_classifier.yaml`. Run one with, for example:
+
+```bash
+uv run python -m base.train_distribution_classifier \
+  --config sample_configs/bit_sequence_classifier.yaml
+```
 
 The workbooks use Bayes optimal classification baselines in `base/bit_sequences.py`
 and `base/estimators.py`.

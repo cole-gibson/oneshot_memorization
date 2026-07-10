@@ -227,7 +227,7 @@ class SequenceClassifierMLP(nn.Module):
         self,
         sequence_length,
         num_classes,
-        embed_dim=256,
+        hidden_dim=1024,
         num_hidden_layers=2,
         dropout=0.0,
     ):
@@ -240,14 +240,11 @@ class SequenceClassifierMLP(nn.Module):
             raise ValueError("num_hidden_layers must be nonnegative")
 
         self.sequence_length = sequence_length
-        self.embed_dim = embed_dim
-        self.sequence_embedding = nn.Parameter(torch.empty(sequence_length, embed_dim))
-        self.input_layer_norm = nn.LayerNorm(embed_dim, elementwise_affine=False)
-        nn.init.normal_(self.sequence_embedding, mean=0.0, std=embed_dim**-0.5)
+        self.hidden_dim = hidden_dim
         self.net = make_mlp(
-            input_dim=sequence_length * embed_dim,
+            input_dim=sequence_length,
             output_dim=num_classes,
-            hidden_dim=4 * embed_dim,
+            hidden_dim=hidden_dim,
             num_hidden_layers=num_hidden_layers,
             dropout=dropout,
         )
@@ -256,9 +253,7 @@ class SequenceClassifierMLP(nn.Module):
         if tokens.shape[1] != self.sequence_length:
             raise ValueError("tokens must have shape (batch_size, sequence_length)")
         signed_tokens = 2.0 * tokens.float() - 1.0
-        x = signed_tokens.unsqueeze(-1) * self.sequence_embedding
-        x = self.input_layer_norm(x).flatten(start_dim=1)
-        logits = self.net(x)
+        logits = self.net(signed_tokens)
         loss = None
         if targets is not None:
             loss = F.cross_entropy(logits, targets)

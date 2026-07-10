@@ -5,6 +5,7 @@ import torch
 
 from base.bit_sequences import (
     ProbabilityVectorClassifierMLP,
+    SequenceClassifierMLP,
     SummarySequenceClassifierMLP,
 )
 from base.data_generator import DirichletZipfBinaryProbabilityVectorGenerator
@@ -36,6 +37,28 @@ def make_config():
             "compile": True,
         },
         "evaluation": {"interval": 1, "seqs_per_distribution": 1},
+    }
+
+
+def make_bit_config():
+    return {
+        "model": {
+            "type": "bit_sequence_mlp",
+            "sequence_length": 5,
+            "num_classes": 2,
+        },
+        "data": {
+            "type": "zipf_bit_binary",
+            "label_scheme": "binary",
+            "num_sequences": 8,
+            "sequence_length": 5,
+        },
+        "training": {
+            "max_iters": 2,
+            "checkpoint_interval": 2,
+            "compile": False,
+        },
+        "evaluation": {"interval": 1},
     }
 
 
@@ -197,6 +220,35 @@ class ProbabilityVectorSettingTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "requires model.type"):
             validate_config(config)
+
+
+class BitSequenceSettingTest(unittest.TestCase):
+    def test_config_does_not_require_distribution_fields(self):
+        validate_config(make_bit_config())
+
+    def test_model_processes_signed_bits_directly(self):
+        model = SequenceClassifierMLP(
+            sequence_length=3,
+            num_classes=2,
+            hidden_dim=16,
+            num_hidden_layers=1,
+        )
+        tokens = torch.tensor([[0, 1, 1], [1, 0, 1]])
+
+        result = model(tokens)
+        expected_logits = model.net(2.0 * tokens.float() - 1.0)
+
+        torch.testing.assert_close(result["logits"], expected_logits)
+
+    def test_identity_labels_require_one_class_per_sequence(self):
+        config = make_bit_config()
+        config["data"]["label_scheme"] = "identity"
+
+        with self.assertRaisesRegex(ValueError, "number of tasks"):
+            validate_config(config)
+
+        config["model"]["num_classes"] = config["data"]["num_sequences"]
+        validate_config(config)
 
 
 if __name__ == "__main__":

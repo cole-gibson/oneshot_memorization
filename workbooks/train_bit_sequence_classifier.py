@@ -55,12 +55,12 @@ def _():
     eval_max_sequences = min(num_sequences, 20_000)
     eval_microbatch_size = 50_000
     eval_interval = 1_000
-    embed_dim = 128
+    hidden_dim = 512
     memorization_margin = 0.001
     return (
         batch_size,
         device_name,
-        embed_dim,
+        hidden_dim,
         eval_interval,
         eval_max_sequences,
         eval_microbatch_size,
@@ -81,7 +81,7 @@ def _(
     batch_size,
     classification_losses,
     device_name,
-    embed_dim,
+    hidden_dim,
     eval_interval,
     eval_max_sequences,
     eval_microbatch_size,
@@ -113,7 +113,7 @@ def _(
     model = SequenceClassifierMLP(
         sequence_length=sequence_length,
         num_classes=num_classes,
-        embed_dim=embed_dim,
+        hidden_dim=hidden_dim,
         num_hidden_layers=2,
         dropout=0.0,
     ).to(device)
@@ -133,7 +133,11 @@ def _(
     print("Bayes optimal loss:", f"{bayes_loss:.4f}")
     print("memorization loss threshold:", f"{memorization_margin:.4f}")
 
-    presentation_counts = torch.zeros(num_sequences, dtype=torch.long)
+    presentation_counts = torch.zeros(
+        num_sequences,
+        dtype=torch.long,
+        device=device,
+    )
     memorization_presentations = torch.full(
         (eval_max_sequences,),
         -1,
@@ -150,7 +154,7 @@ def _(
         )
         labels = data_generator.labels[sequence_ids]
         presentation_counts += torch.bincount(
-            sequence_ids.cpu(),
+            sequence_ids,
             minlength=num_sequences,
         )
 
@@ -177,7 +181,9 @@ def _(
                 microbatch_size=eval_microbatch_size,
             )
             memorized = eval_losses <= memorization_margin
-            tracked_presentations = presentation_counts[:eval_max_sequences].clone()
+            tracked_presentations = (
+                presentation_counts[:eval_max_sequences].cpu().clone()
+            )
             newly_memorized = (memorization_presentations < 0) & memorized
             memorization_presentations[newly_memorized] = (
                 tracked_presentations[newly_memorized]

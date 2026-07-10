@@ -12,7 +12,9 @@ import yaml
 
 from base.bit_sequences import (
     ProbabilityVectorClassifierMLP,
+    SequenceClassifierMLP,
     SummarySequenceClassifierMLP,
+    ZipfBitSequenceGenerator,
 )
 from base.data_generator import (
     DirichletZipfBinaryClassificationGenerator,
@@ -31,6 +33,7 @@ from base.training_utils import (
 
 
 MODEL_TYPES = {
+    "bit_sequence_mlp": SequenceClassifierMLP,
     "probability_mlp": ProbabilityVectorClassifierMLP,
     "summary_mlp": SummarySequenceClassifierMLP,
 }
@@ -40,13 +43,25 @@ DATA_TYPES = {
     "dirichlet_zipf_binary_probability_vector": (
         DirichletZipfBinaryProbabilityVectorGenerator
     ),
+    "zipf_bit_binary": ZipfBitSequenceGenerator,
 }
 
 PROBABILITY_VECTOR_DATA_TYPE = "dirichlet_zipf_binary_probability_vector"
+BIT_SEQUENCE_DATA_TYPE = "zipf_bit_binary"
+
+
+def is_bit_sequence_config(config):
+    return config["data"]["type"] == BIT_SEQUENCE_DATA_TYPE
+
+
+def num_tasks(config):
+    if is_bit_sequence_config(config):
+        return config["data"]["num_sequences"]
+    return config["data"]["num_distributions"]
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train a distribution-label classifier.")
+    parser = argparse.ArgumentParser(description="Train a Zipf-sampled classifier.")
     parser.add_argument("--config", type=Path, required=True)
     parser.add_argument("--resume-from", type=Path, default=None)
     parser.add_argument("--seed", type=int, default=None)
@@ -68,15 +83,18 @@ def validate_config(config):
     if data.get("type") not in DATA_TYPES:
         raise ValueError(f"unknown data.type {data.get('type')!r}")
     is_probability_vector = data["type"] == PROBABILITY_VECTOR_DATA_TYPE
-    expected_model_type = (
-        "probability_mlp" if is_probability_vector else "summary_mlp"
-    )
+    is_bit_sequence = data["type"] == BIT_SEQUENCE_DATA_TYPE
+    expected_model_type = {
+        "dirichlet_zipf_binary": "summary_mlp",
+        PROBABILITY_VECTOR_DATA_TYPE: "probability_mlp",
+        BIT_SEQUENCE_DATA_TYPE: "bit_sequence_mlp",
+    }[data["type"]]
     if model["type"] != expected_model_type:
         raise ValueError(
             f"data.type {data['type']!r} requires model.type "
             f"{expected_model_type!r}"
         )
-    if model["vocab_size"] != data["num_states"]:
+    if not is_bit_sequence and model["vocab_size"] != data["num_states"]:
         raise ValueError("model.vocab_size must equal data.num_states")
     if (
         not is_probability_vector
@@ -86,11 +104,11 @@ def validate_config(config):
     label_scheme = data.get("label_scheme", "binary")
     if label_scheme not in ("binary", "identity"):
         raise ValueError("data.label_scheme must be 'binary' or 'identity'")
-    expected_classes = 2 if label_scheme == "binary" else data["num_distributions"]
+    expected_classes = 2 if label_scheme == "binary" else num_tasks(config)
     if model.get("num_classes", expected_classes) != expected_classes:
         raise ValueError(
             "model.num_classes must be 2 for binary labels or "
-            "data.num_distributions for identity labels"
+            "the number of tasks for identity labels"
         )
     if training["max_iters"] < 1:
         raise ValueError("training.max_iters must be at least 1")
@@ -112,10 +130,10 @@ def validate_config(config):
         raise ValueError(
             "evaluation.points_per_decade must be a positive integer"
         )
-    if is_probability_vector:
+    if is_probability_vector or is_bit_sequence:
         if evaluation.get("seqs_per_distribution", 1) != 1:
             raise ValueError(
-                "evaluation.seqs_per_distribution must be 1 for probability "
+                "evaluation.seqs_per_distribution must be 1 for deterministic "
                 "vector data"
             )
     elif evaluation["seqs_per_distribution"] < 1:
@@ -133,11 +151,18 @@ def build_data_generator(config, device, generator, checkpoint=None):
     data = dict(config["data"])
     data.pop("type")
     data.pop("label_scheme", None)
-    data.pop("sequence_length", None)
     data.pop("batch_size")
-    if checkpoint is not None:
-        data["distributions"] = checkpoint["distributions"].to(device)
-        data["distribution_labels"] = checkpoint["distribution_labels"].to(device)
+    if is_bit_sequence_config(config):
+        if checkpoint is not None:
+            data["sequences"] = checkpoint["sequences"].to(device)
+            data["labels"] = checkpoint["labels"].to(device)
+    else:
+        data.pop("sequence_length", None)
+        if checkpoint is not None:
+            data["distributions"] = checkpoint["distributions"].to(device)
+            data["distribution_labels"] = checkpoint["distribution_labels"].to(
+                device
+            )
     return DATA_TYPES[config["data"]["type"]](
         **data,
         device=device,
@@ -285,24 +310,40 @@ def save_checkpoint(
     train_generator,
     eval_batch,
 ):
-    torch.save(
-        {
-            "model_state": model.state_dict(),
-            "optimizer_state": optimizer.state_dict(),
-            "iteration": iteration,
-            "config": config,
-            "run_dir": str(run_dir),
-            "rng_state": rng_state(train_generator),
-            "presentation_counts": presentation_counts.cpu(),
-            "distributions": data_generator.distributions.cpu(),
-            "distribution_labels": data_generator.distribution_labels.cpu(),
-            "eval_batch": {key: value.cpu() for key, value in eval_batch.items()},
-        },
-        path,
-    )
+    state = {
+        "model_state": model.state_dict(),
+        "optimizer_state": optimizer.state_dict(),
+        "iteration": iteration,
+        "config": config,
+        "run_dir": str(run_dir),
+        "rng_state": rng_state(train_generator),
+        "presentation_counts": presentation_counts.cpu(),
+        "eval_batch": {key: value.cpu() for key, value in eval_batch.items()},
+    }
+    if is_bit_sequence_config(config):
+        state["sequences"] = data_generator.sequences.cpu()
+        state["labels"] = data_generator.labels.cpu()
+    else:
+        state["distributions"] = data_generator.distributions.cpu()
+        state["distribution_labels"] = data_generator.distribution_labels.cpu()
+    torch.save(state, path)
 
 
 def make_eval_batch(data_generator, config, eval_generator):
+    if is_bit_sequence_config(config):
+        num_sequences = min(
+            config["evaluation"].get("num_sequences", num_tasks(config)),
+            num_tasks(config),
+        )
+        ids = torch.arange(num_sequences, device=data_generator.device)
+        inputs = data_generator.sample_from_sequence_ids(ids)
+        labels = (
+            ids
+            if config["data"].get("label_scheme", "binary") == "identity"
+            else data_generator.labels[ids]
+        )
+        return {"tokens": inputs, "labels": labels, "distribution_ids": ids}
+
     num_distributions = min(
         config["evaluation"].get(
             "num_distributions",
@@ -371,12 +412,18 @@ def evaluate(
     loss_sums.scatter_add_(0, ids, losses)
     loss_counts = torch.bincount(ids, minlength=num_distributions).clamp_min(1)
     mean_losses = (loss_sums / loss_counts.to(losses.dtype)).cpu()
-    labels_cpu = data_generator.distribution_labels[:num_distributions].cpu()
+    if config["data"].get("label_scheme", "binary") == "identity":
+        labels_cpu = torch.arange(num_distributions)
+    elif is_bit_sequence_config(config):
+        labels_cpu = data_generator.labels[:num_distributions].cpu()
+    else:
+        labels_cpu = data_generator.distribution_labels[:num_distributions].cpu()
     counts_cpu = presentation_counts[:num_distributions].cpu()
 
+    id_field = "sequence_id" if is_bit_sequence_config(config) else "distribution_id"
     fieldnames = [
         "iter",
-        "distribution_id",
+        id_field,
         "label",
         "loss",
         "training_seen_count",
@@ -384,7 +431,7 @@ def evaluate(
     rows = [
         {
             "iter": iteration,
-            "distribution_id": distribution_id,
+            id_field: distribution_id,
             "label": int(labels_cpu[distribution_id].item()),
             "loss": f"{mean_losses[distribution_id].item():.8f}",
             "training_seen_count": int(counts_cpu[distribution_id].item()),
@@ -444,7 +491,7 @@ def main():
     amp_dtype = resolve_amp_dtype(config, device)
     grad_scaler = make_grad_scaler(config, device)
     presentation_counts = torch.zeros(
-        config["data"]["num_distributions"],
+        num_tasks(config),
         dtype=torch.long,
         device=device,
     )
@@ -476,7 +523,11 @@ def main():
         )
 
     train_log = run_dir / "train_log.csv"
-    eval_log = run_dir / "eval_by_distribution.csv"
+    eval_log = run_dir / (
+        "eval_by_sequence.csv"
+        if is_bit_sequence_config(config)
+        else "eval_by_distribution.csv"
+    )
     start_time = time.perf_counter()
     last_report_time = start_time
     last_report_iter = start_iter
@@ -495,7 +546,13 @@ def main():
     model.train()
     for iteration in range(start_iter + 1, max_iters + 1):
         batch_size = config["data"]["batch_size"]
-        if config["data"]["type"] == PROBABILITY_VECTOR_DATA_TYPE:
+        if is_bit_sequence_config(config):
+            inputs, distribution_ids = data_generator.sample(
+                batch_size=batch_size,
+                return_sequence_ids=True,
+            )
+            binary_labels = data_generator.labels[distribution_ids]
+        elif config["data"]["type"] == PROBABILITY_VECTOR_DATA_TYPE:
             inputs, distribution_ids, binary_labels = data_generator.sample(
                 batch_size=batch_size,
                 return_distribution_ids=True,
@@ -515,7 +572,7 @@ def main():
         )
         presentation_counts += torch.bincount(
             distribution_ids,
-            minlength=config["data"]["num_distributions"],
+            minlength=num_tasks(config),
         )
         if compile_training:
             loss = compiled_training_step(inputs, labels)
