@@ -16,7 +16,7 @@ def parse_args():
     parser.add_argument(
         "runtime_manifest",
         type=Path,
-        help="TSV with rows of: config_path<TAB>time",
+        help="CSV with rows of: config_path,time",
     )
     parser.add_argument(
         "--output-root",
@@ -74,13 +74,13 @@ def sbatch_line(key, value):
 def read_runtime_manifest(path):
     rows = []
     with path.open(newline="", encoding="utf-8") as manifest_file:
-        reader = csv.reader(manifest_file, delimiter="\t")
+        reader = csv.reader(manifest_file)
         for line_number, row in enumerate(reader, start=1):
             if not row or all(not value.strip() for value in row):
                 continue
             if len(row) != 2:
                 raise ValueError(
-                    f"{path}:{line_number} must contain config_path<TAB>time"
+                    f"{path}:{line_number} must contain config_path,time"
                 )
             raw_config_path, runtime = [value.strip() for value in row]
             if not raw_config_path:
@@ -161,9 +161,9 @@ def main():
     log_dir.mkdir(parents=True, exist_ok=True)
 
     generated_sbatch_paths = []
-    manifest_path = experiment_dir / "manifest.tsv"
+    manifest_path = experiment_dir / "manifest.csv"
     with manifest_path.open("w", newline="", encoding="utf-8") as manifest_file:
-        writer = csv.writer(manifest_file, delimiter="\t", lineterminator="\n")
+        writer = csv.writer(manifest_file, lineterminator="\n")
         for index, (source_path, runtime) in enumerate(config_runtimes):
             config = copy.deepcopy(load_yaml(source_path))
             config["experiment_name"] = experiment_name
