@@ -645,6 +645,7 @@ def main():
                 should_evaluate or iteration in logarithmic_eval_iterations
             )
         if should_evaluate:
+            eval_start_time = time.perf_counter()
             evaluate(
                 model,
                 data_generator,
@@ -654,6 +655,11 @@ def main():
                 eval_log,
                 iteration,
                 amp_dtype,
+            )
+            print(
+                f"evaluation iter {iteration} "
+                f"time_sec {time.perf_counter() - eval_start_time:.4f}",
+                flush=True,
             )
         if should_checkpoint:
             for path in (

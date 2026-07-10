@@ -20,9 +20,15 @@ def _():
     if str(repo_root) not in sys.path:
         sys.path.insert(0, str(repo_root))
 
-    from base.bit_sequences import SummarySequenceClassifierMLP
+    from base.bit_sequences import (
+        ProbabilityVectorClassifierMLP,
+        SequenceClassifierMLP,
+        SummarySequenceClassifierMLP,
+    )
 
     MODEL_TYPES = {
+        "bit_sequence_mlp": SequenceClassifierMLP,
+        "probability_mlp": ProbabilityVectorClassifierMLP,
         "summary_mlp": SummarySequenceClassifierMLP,
     }
     return MODEL_TYPES, Path, np, pd, plt, sns, torch, yaml
@@ -36,9 +42,11 @@ def _(Path):
     loss_threshold = 0.1
     loss_average_window = 10
     initialization_exclusion_iterations = 100
+    exclude_first_evaluation_memorizations = True
     rank_bin_count = 20
     return (
         array_output_dir,
+        exclude_first_evaluation_memorizations,
         initialization_exclusion_iterations,
         loss_average_window,
         loss_threshold,
@@ -118,23 +126,37 @@ def _(Path, pd):
         run_dirs = []
         for config_path in array_dir.rglob("config.yaml"):
             run_dir = config_path.parent
-            if (run_dir / "eval_by_distribution.csv").exists():
+            if any(
+                (run_dir / filename).exists()
+                for filename in ("eval_by_distribution.csv", "eval_by_sequence.csv")
+            ):
                 run_dirs.append(run_dir)
         return sorted(set(run_dirs))
 
     def load_eval_csv(path):
         df = pd.read_csv(path)
-        df = df.rename(columns={"iter": "iteration", "loss": "eval_loss"})
+        df = df.rename(
+            columns={
+                "iter": "iteration",
+                "loss": "eval_loss",
+                "distribution_id": "task_id",
+                "sequence_id": "task_id",
+            }
+        )
         required = {
             "iteration",
-            "distribution_id",
+            "task_id",
             "eval_loss",
             "training_seen_count",
         }
         missing = required - set(df.columns)
         if missing:
             raise ValueError(f"{path} is missing columns: {sorted(missing)}")
-        df["distribution_rank"] = df["distribution_id"] + 1
+        df["task_rank"] = df["task_id"] + 1
+        # Keep the existing analysis columns while treating sequences and
+        # distributions uniformly as tasks.
+        df["distribution_id"] = df["task_id"]
+        df["distribution_rank"] = df["task_rank"]
         return df
 
     return find_run_dirs, load_eval_csv
@@ -155,7 +177,14 @@ def _(
         run_rows = []
         for run_dir in find_run_dirs(array_dir):
             config = load_yaml(run_dir / "config.yaml")
-            eval_path = run_dir / "eval_by_distribution.csv"
+            eval_path = next(
+                path
+                for path in (
+                    run_dir / "eval_by_distribution.csv",
+                    run_dir / "eval_by_sequence.csv",
+                )
+                if path.exists()
+            )
             eval_df = load_eval_csv(eval_path)
             run_id = run_dir.name
             eval_df["run_id"] = run_id
@@ -181,6 +210,8 @@ def _(
                     "run_dir",
                     "eval_path",
                     "iteration",
+                    "task_id",
+                    "task_rank",
                     "distribution_id",
                     "distribution_rank",
                     "eval_loss",
@@ -213,6 +244,7 @@ def _(pd):
                     "distribution_rank",
                     "min_training_seen_count",
                     "previous_training_seen_count",
+                    "memorized_at_first_evaluation",
                 ]
             )
         if "training_seen_count" not in eval_df.columns:
@@ -242,6 +274,7 @@ def _(pd):
                     "distribution_id": distribution_id,
                     "min_training_seen_count": hit_row["training_seen_count"],
                     "previous_training_seen_count": previous_training_seen_count,
+                    "memorized_at_first_evaluation": hit_position == 0,
                 }
             )
 
@@ -252,6 +285,7 @@ def _(pd):
                 "distribution_id",
                 "min_training_seen_count",
                 "previous_training_seen_count",
+                "memorized_at_first_evaluation",
             ],
         )
         distributions = eval_df[
@@ -335,6 +369,24 @@ def _(eval_df, sns):
 
 @app.cell
 def _(eval_df, first_below_threshold, loss_threshold, run_df):
+    _zero_appearance_memorizations = eval_df[
+        (eval_df["rolling_eval_loss"] < loss_threshold)
+        & (eval_df["training_seen_count"] == 0)
+    ][
+        [
+            "run_id",
+            "task_id",
+            "task_rank",
+            "iteration",
+            "eval_loss",
+            "eval_path",
+        ]
+    ]
+    if not _zero_appearance_memorizations.empty:
+        print(
+            "WARNING: tasks were memorized with 0 training appearances:\n"
+            + _zero_appearance_memorizations.to_string(index=False)
+        )
     threshold_df = first_below_threshold(eval_df, loss_threshold)
     threshold_df = threshold_df.merge(
         run_df[
@@ -393,41 +445,59 @@ def _(eval_df, loss_threshold, pd, plt, run_df, sns):
 
 
 @app.cell
-def _(plt, sns, threshold_df):
-    _plot_df = threshold_df.dropna(subset=["min_training_seen_count"]).copy()
+def _(np, pd, plt, rank_bin_count, sns, threshold_df):
+    _plot_df = threshold_df.copy()
+    _plot_df["distribution_rank"] = pd.to_numeric(_plot_df["distribution_rank"])
+    _plot_df = _plot_df[_plot_df["distribution_rank"] > 0]
     if _plot_df.empty:
         _fig, _ax = plt.subplots(figsize=(7, 4))
         _ax.text(
             0.5,
             0.5,
-            "No memorized distributions",
+            "No tasks",
             ha="center",
             va="center",
             transform=_ax.transAxes,
         )
         _ax.set_axis_off()
     else:
-        _grid = sns.displot(
-            data=_plot_df,
-            x="distribution_rank",
-            col="parameter_setting",
-            col_wrap=2,
-            bins=30,
-            height=3.2,
-            aspect=1.3,
-            facet_kws={"sharey": False},
+        _log_rank = np.log10(_plot_df["distribution_rank"])
+        _bin_count = min(
+            max(1, int(rank_bin_count)),
+            _plot_df["distribution_rank"].nunique(),
         )
-        _grid.set(
-            # xscale="log",
-            xlabel="Task rank",
-            ylabel="Memorized tasks",
+        _bin_edges = (
+            np.array([_log_rank.min() - 0.5, _log_rank.max() + 0.5])
+            if _log_rank.min() == _log_rank.max()
+            else np.linspace(_log_rank.min(), _log_rank.max(), _bin_count + 1)
         )
-        _grid.set_titles("{col_name}")
-        _grid.fig.suptitle(
-            "Distribution of memorized tasks by task rank",
-            y=1.02,
+        _plot_df["rank_bin"] = pd.cut(
+            _log_rank, bins=_bin_edges, labels=False, include_lowest=True
         )
-        _fig = _grid.fig
+        _plot_df["is_unmemorized"] = _plot_df["min_training_seen_count"].isna()
+        _binned_df = (
+            _plot_df.dropna(subset=["rank_bin"])
+            .groupby(["parameter_setting", "rank_bin"], as_index=False)
+            .agg(proportion_unmemorized=("is_unmemorized", "mean"))
+        )
+        _centers = 10 ** ((_bin_edges[:-1] + _bin_edges[1:]) / 2)
+        _binned_df["task_rank"] = _binned_df["rank_bin"].map(
+            lambda rank_bin: _centers[int(rank_bin)]
+        )
+        _fig, _ax = plt.subplots(figsize=(8, 5))
+        sns.lineplot(
+            data=_binned_df,
+            x="task_rank",
+            y="proportion_unmemorized",
+            hue="parameter_setting",
+            marker="o",
+            ax=_ax,
+        )
+        _ax.set_xscale("log")
+        _ax.set_ylim(-0.02, 1.02)
+        _ax.set_xlabel("Task rank bin center")
+        _ax.set_ylabel("Proportion unmemorized")
+        _ax.set_title("Proportion of unmemorized tasks by task rank")
     _fig
     return
 
@@ -477,8 +547,10 @@ def _(pd, plt, sns, threshold_df):
 
 
 @app.cell
-def _(pd, plt, sns, threshold_df):
+def _(exclude_first_evaluation_memorizations, pd, plt, sns, threshold_df):
     _plot_df = threshold_df.dropna(subset=["min_training_seen_count"]).copy()
+    if exclude_first_evaluation_memorizations:
+        _plot_df = _plot_df[~_plot_df["memorized_at_first_evaluation"]]
     _previous_counts = _plot_df["previous_training_seen_count"].fillna(1)
     _previous_counts = pd.to_numeric(_previous_counts)
     _plot_df["min_training_seen_count"] = pd.to_numeric(
@@ -545,8 +617,18 @@ def _(pd, plt, sns, threshold_df):
 
 
 @app.cell
-def _(np, pd, plt, rank_bin_count, sns, threshold_df):
+def _(
+    exclude_first_evaluation_memorizations,
+    np,
+    pd,
+    plt,
+    rank_bin_count,
+    sns,
+    threshold_df,
+):
     _plot_df = threshold_df.dropna(subset=["min_training_seen_count"]).copy()
+    if exclude_first_evaluation_memorizations:
+        _plot_df = _plot_df[~_plot_df["memorized_at_first_evaluation"]]
     _plot_df["distribution_rank"] = pd.to_numeric(_plot_df["distribution_rank"])
     _plot_df["min_training_seen_count"] = pd.to_numeric(
         _plot_df["min_training_seen_count"]
