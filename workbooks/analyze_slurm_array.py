@@ -10,6 +10,7 @@ def _():
     from pathlib import Path
 
     import matplotlib.pyplot as plt
+    import numpy as np
     import pandas as pd
     import seaborn as sns
     import torch
@@ -24,16 +25,25 @@ def _():
     MODEL_TYPES = {
         "summary_mlp": SummarySequenceClassifierMLP,
     }
-    return MODEL_TYPES, Path, pd, plt, sns, torch, yaml
+    return MODEL_TYPES, Path, np, pd, plt, sns, torch, yaml
 
 
 @app.cell
 def _(Path):
     array_output_dir = Path(
-        "/home/cg5763/data/output_oneshot_memorization/scaling-striped-gaur"
+        "/home/cg5763/data/output_oneshot_memorization/scaling-garnet-jackalope"
     )
-    loss_threshold = 0.01
-    return array_output_dir, loss_threshold
+    loss_threshold = 0.1
+    loss_average_window = 10
+    initialization_exclusion_iterations = 100
+    rank_bin_count = 20
+    return (
+        array_output_dir,
+        initialization_exclusion_iterations,
+        loss_average_window,
+        loss_threshold,
+        rank_bin_count,
+    )
 
 
 @app.cell
@@ -148,7 +158,6 @@ def _(
             eval_path = run_dir / "eval_by_distribution.csv"
             eval_df = load_eval_csv(eval_path)
             run_id = run_dir.name
-            eval_df['rolling_eval_loss'] = eval_df.groupby('distribution_id')['eval_loss'].transform(lambda x: x.rolling(window=10, min_periods=1).mean())
             eval_df["run_id"] = run_id
             eval_df["run_dir"] = str(run_dir)
             eval_df["eval_path"] = str(eval_path)
@@ -292,9 +301,29 @@ def _(pd):
 
 
 @app.cell
-def _(array_output_dir, load_array_runs):
+def _(
+    array_output_dir,
+    initialization_exclusion_iterations,
+    load_array_runs,
+    loss_average_window,
+):
     eval_df, run_df = load_array_runs(array_output_dir)
-    print(f"loaded {len(run_df)} runs and {len(eval_df)} eval rows")
+    loaded_eval_rows = len(eval_df)
+    eval_df = eval_df[
+        eval_df["iteration"] > initialization_exclusion_iterations
+    ].copy()
+    eval_df = eval_df.sort_values(["run_id", "distribution_id", "iteration"])
+    eval_df["rolling_eval_loss"] = eval_df.groupby(
+        ["run_id", "distribution_id"]
+    )["eval_loss"].transform(
+        lambda loss: loss.rolling(window=loss_average_window, min_periods=1).mean()
+    )
+    print(
+        f"loaded {len(run_df)} runs and {loaded_eval_rows} eval rows; "
+        f"kept {len(eval_df)} eval rows after excluding iterations <= "
+        f"{initialization_exclusion_iterations}; "
+        f"using {loss_average_window}-eval running average for thresholding"
+    )
     return eval_df, run_df
 
 
@@ -449,42 +478,155 @@ def _(pd, plt, sns, threshold_df):
 
 @app.cell
 def _(pd, plt, sns, threshold_df):
-    _fig, _ax = plt.subplots(figsize=(9, 5))
     _plot_df = threshold_df.dropna(subset=["min_training_seen_count"]).copy()
-    sns.scatterplot(
-        data=_plot_df,
-        x="distribution_rank",
-        y="min_training_seen_count",
-        hue="parameter_setting",
-        marker="o",
-        ax=_ax,
-    )
-    _previous_counts = _plot_df["previous_training_seen_count"].fillna(
+    _previous_counts = _plot_df["previous_training_seen_count"].fillna(1)
+    _previous_counts = pd.to_numeric(_previous_counts)
+    _plot_df["min_training_seen_count"] = pd.to_numeric(
         _plot_df["min_training_seen_count"]
     )
-    _previous_counts = pd.to_numeric(_previous_counts)
-    _min_counts = pd.to_numeric(_plot_df["min_training_seen_count"])
-    _lower_error = (
-        _min_counts - _previous_counts
+    _plot_df["lower_error"] = (
+        _plot_df["min_training_seen_count"] - _previous_counts
     ).clip(lower=0)
-    _ax.errorbar(
-        _plot_df["distribution_rank"],
-        _min_counts,
-        yerr=[_lower_error, _lower_error * 0],
-        fmt="none",
-        ecolor="0.35",
-        elinewidth=0.8,
-        capsize=2,
-        # elinewidth=0.,
-        # capsize=0,
-        alpha=0.6,
-        zorder=1.5,
+
+    if _plot_df.empty:
+        _fig, _ax = plt.subplots(figsize=(7, 4))
+        _ax.text(
+            0.5,
+            0.5,
+            "No memorized distributions",
+            ha="center",
+            va="center",
+            transform=_ax.transAxes,
+        )
+        _ax.set_axis_off()
+    else:
+        _grid = sns.relplot(
+            data=_plot_df,
+            x="distribution_rank",
+            y="min_training_seen_count",
+            col="parameter_setting",
+            col_wrap=2,
+            kind="scatter",
+            marker=".",
+            linewidth=0,
+            edgecolor="none",
+            height=3.2,
+            aspect=1.3,
+        )
+        for _setting, _ax in _grid.axes_dict.items():
+            _facet_df = _plot_df[_plot_df["parameter_setting"].eq(_setting)]
+            _ax.errorbar(
+                _facet_df["distribution_rank"],
+                _facet_df["min_training_seen_count"],
+                yerr=[_facet_df["lower_error"], _facet_df["lower_error"] * 0],
+                fmt="none",
+                ecolor="0.35",
+                # elinewidth=0.8,
+                # capsize=2,
+                elinewidth=0.,
+                capsize=0,
+                alpha=0.6,
+                zorder=1.5,
+            )
+            _ax.set_xscale("log")
+            _ax.set_yscale("log")
+        _grid.set(
+            xlabel="Distribution rank",
+            ylabel="Minimum training appearances",
+        )
+        _grid.set_titles("{col_name}")
+        _grid.fig.suptitle(
+            "Appearances needed to cross loss threshold",
+            y=1.02,
+        )
+        _fig = _grid.fig
+    _fig
+    return
+
+
+@app.cell
+def _(np, pd, plt, rank_bin_count, sns, threshold_df):
+    _plot_df = threshold_df.dropna(subset=["min_training_seen_count"]).copy()
+    _plot_df["distribution_rank"] = pd.to_numeric(_plot_df["distribution_rank"])
+    _plot_df["min_training_seen_count"] = pd.to_numeric(
+        _plot_df["min_training_seen_count"]
     )
-    _ax.set_xscale("log")
-    _ax.set_yscale("log")
-    _ax.set_xlabel("Distribution rank")
-    _ax.set_ylabel("Minimum training appearances")
-    _ax.set_title("Appearances needed to cross loss threshold")
+    _plot_df = _plot_df[
+        (_plot_df["distribution_rank"] > 0)
+        & (_plot_df["min_training_seen_count"] > 0)
+    ]
+
+    if _plot_df.empty:
+        _fig, _ax = plt.subplots(figsize=(7, 4))
+        _ax.text(
+            0.5,
+            0.5,
+            "No memorized distributions",
+            ha="center",
+            va="center",
+            transform=_ax.transAxes,
+        )
+        _ax.set_axis_off()
+    else:
+        _log_rank = np.log10(_plot_df["distribution_rank"])
+        _bin_count = min(
+            max(1, int(rank_bin_count)),
+            _plot_df["distribution_rank"].nunique(),
+        )
+        if _log_rank.min() == _log_rank.max():
+            _bin_edges = np.array([_log_rank.min() - 0.5, _log_rank.max() + 0.5])
+            _bin_count = 1
+        else:
+            _bin_edges = np.linspace(_log_rank.min(), _log_rank.max(), _bin_count + 1)
+        _plot_df["rank_bin"] = pd.cut(
+            _log_rank,
+            bins=_bin_edges,
+            labels=False,
+            include_lowest=True,
+        )
+        _plot_df = _plot_df.dropna(subset=["rank_bin"]).copy()
+        _plot_df["rank_bin"] = _plot_df["rank_bin"].astype(int)
+        _bin_centers = 10 ** ((_bin_edges[:-1] + _bin_edges[1:]) / 2)
+
+        _binned_df = (
+            _plot_df.groupby(["parameter_setting", "rank_bin"], as_index=False)
+            .agg(
+                mean_training_seen_count=("min_training_seen_count", "mean"),
+                std_training_seen_count=("min_training_seen_count", "std"),
+                memorized_tasks=("min_training_seen_count", "size"),
+            )
+        )
+        _binned_df["std_training_seen_count"] = _binned_df[
+            "std_training_seen_count"
+        ].fillna(0)
+        _binned_df["bin_center_rank"] = _binned_df["rank_bin"].map(
+            lambda rank_bin: _bin_centers[rank_bin]
+        )
+
+        _fig, _ax = plt.subplots(figsize=(8, 5))
+        _palette = sns.color_palette(
+            n_colors=_binned_df["parameter_setting"].nunique()
+        )
+        for (_setting, _setting_df), _color in zip(
+            _binned_df.groupby("parameter_setting"),
+            _palette,
+        ):
+            _ax.errorbar(
+                _setting_df["bin_center_rank"],
+                _setting_df["mean_training_seen_count"],
+                yerr=_setting_df["std_training_seen_count"],
+                marker="o",
+                linewidth=1.2,
+                capsize=2,
+                label=_setting,
+                color=_color,
+            )
+        _ax.set_xscale("log")
+        _ax.set_yscale("log")
+        _ax.set_xlabel("Distribution rank bin center")
+        _ax.set_ylabel("Mean minimum training appearances")
+        _ax.set_title("Binned appearances needed to cross loss threshold")
+        _ax.legend(title="Parameter setting")
     _fig
     return
 
