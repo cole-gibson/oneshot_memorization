@@ -9,49 +9,52 @@ import yaml
 
 ###########
 
-# REFERENCE_CONFIG = Path("sample_configs/bit_sequence_classifier.yaml")
-# OUTPUT_DIR = Path("configs/bit_sequence")
-# SWEEP = [
-#     (("training.max_iters"), [1000]),
-#     (("training.report_interval"), [100]),
-#     (("training.checkpoint_interval"), [1000]),
+REFERENCE_CONFIG = Path("sample_configs/bit_sequence_classifier.yaml")
+OUTPUT_DIR = Path("configs/bit_sequence_smaller")
+SWEEP = [
+    (("training.max_iters"), [50000]),
+    (("training.report_interval"), [1000]),
+    (("training.checkpoint_interval"), [1000]),
 
-#     (("data.num_sequences"), [10000]),
-#     (("data.batch_size"), [256]),
+    (("data.num_sequences"), [100000]),
+    (("data.batch_size"), [256]),
 
-#     (("model.hidden_dim"), [1024, 2048, 4096, 8192]),
+    # (("model.hidden_dim"), [1024, 2048, 4096, 8192]),
+    (("model.hidden_dim"), [128, 256, 512]),
 
-#     (("evaluation.spacing"), ['linear']),
-#     (("evaluation.interval"), [16]),
-#     (("evaluation.num_sequences"), [10000]),
-#     (("evaluation.microbatch_size"), [10000])
-# ]
-# EXPERIMENT_NAME = 'bit_sequence_benchmark'
-# DESCRIPTION = None
-# OVERWRITE = True
+    (("evaluation.spacing"), ['logarithmic']),
+    (("evaluation.points_per_decade"), [10]),
+    (("evaluation.interval"), [None]),
+    (("evaluation.num_sequences"), [100000]),
+    (("evaluation.microbatch_size"), [100000])
+]
+EXPERIMENT_NAME = 'bit_sequence'
+DESCRIPTION = None
+OVERWRITE = True
 
 ############
 
-REFERENCE_CONFIG = Path("sample_configs/distribution_vector_classifier.yaml")
-OUTPUT_DIR = Path("configs/distribution_vector")
-SWEEP = [
-    (("training.max_iters"), [1000]),
-    (("training.report_interval"), [100]),
-    (("training.checkpoint_interval"), [1000]),
+# REFERENCE_CONFIG = Path("sample_configs/distribution_vector_classifier.yaml")
+# OUTPUT_DIR = Path("configs/distribution_vector")
+# SWEEP = [
+#     (("training.max_iters"), [50000]),
+#     (("training.report_interval"), [1000]),
+#     (("training.checkpoint_interval"), [1000]),
 
-    (("data.num_distributions"), [10000]),
-    (("data.batch_size"), [256]),
+#     (("data.num_distributions"), [100000]),
+#     (("data.batch_size"), [256]),
 
-    (("model.embed_dim"), [256, 512, 1024, 2048]),
+#     (("model.embed_dim"), [256, 512, 1024, 2048]),
 
-    (("evaluation.spacing"), ['linear']),
-    (("evaluation.interval"), [16]),
-    (("evaluation.num_distributions"), [10000]),
-    (("evaluation.microbatch_size"), [10000])
-]
-EXPERIMENT_NAME = 'distribution_vector_benchmark'
-DESCRIPTION = None
-OVERWRITE = True
+#     (("evaluation.spacing"), ['logarithmic']),
+#     (("evaluation.points_per_decade"), [10]),
+#     (("evaluation.interval"), [None]),
+#     (("evaluation.num_distributions"), [100000]),
+#     (("evaluation.microbatch_size"), [100000])
+# ]
+# EXPERIMENT_NAME = 'distribution_vector'
+# DESCRIPTION = None
+# OVERWRITE = True
 
 
 def load_yaml(path):

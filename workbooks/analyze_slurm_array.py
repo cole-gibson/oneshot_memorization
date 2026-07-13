@@ -37,12 +37,13 @@ def _():
 @app.cell
 def _(Path):
     array_output_dir = Path(
-        "/home/cg5763/data/output_oneshot_memorization/distribution-vector-benchmark-voracious-oyster"
+        # "/home/cg5763/data/output_oneshot_memorization/distribution-vector-black-chimpanzee"
+        "/home/cg5763/data/output_oneshot_memorization/bit-sequence-foamy-ape"
     )
-    loss_threshold = 0.001
+    loss_threshold = 0.0001
     loss_average_window = 1
     initialization_exclusion_iterations = 100
-    exclude_first_evaluation_memorizations = True
+    exclude_first_evaluation_memorizations = False
     rank_bin_count = 20
     return (
         array_output_dir,
@@ -78,10 +79,12 @@ def _(MODEL_TYPES, Path, torch, yaml):
         preferred = [
             "type",
             "embed_dim",
+            "hidden_dim",
             "num_heads",
             "num_layers",
             "mlp_ratio",
             "mlp_num_layers",
+            "num_hidden_layers",
         ]
         parts = [
             f"{key}={model[key]}"
@@ -134,7 +137,24 @@ def _(Path, pd):
         return sorted(set(run_dirs))
 
     def load_eval_csv(path):
-        df = pd.read_csv(path)
+        analysis_columns = {
+            "iter",
+            "loss",
+            "distribution_id",
+            "sequence_id",
+            "training_seen_count",
+        }
+        df = pd.read_csv(
+            path,
+            usecols=lambda column: column in analysis_columns,
+            dtype={
+                "iter": "int32",
+                "distribution_id": "int32",
+                "sequence_id": "int32",
+                "training_seen_count": "int32",
+                "loss": "float64",
+            },
+        )
         df = df.rename(
             columns={
                 "iter": "iteration",
@@ -249,44 +269,25 @@ def _(pd):
             )
         if "training_seen_count" not in eval_df.columns:
             raise ValueError("eval data must include training_seen_count")
-        first_hit_rows = []
-        for (run_id, distribution_id), group in eval_df.groupby(
-            ["run_id", "distribution_id"]
-        ):
-            group = group.sort_values("iteration")
-            hit_positions = (
-                (group["rolling_eval_loss"] < threshold).to_numpy().nonzero()[0]
-            )
-            if len(hit_positions) == 0:
-                continue
-
-            hit_position = hit_positions[0]
-            hit_row = group.iloc[hit_position]
-            previous_training_seen_count = pd.NA
-            if hit_position > 0:
-                previous_training_seen_count = group.iloc[hit_position - 1][
-                    "training_seen_count"
-                ]
-
-            first_hit_rows.append(
-                {
-                    "run_id": run_id,
-                    "distribution_id": distribution_id,
-                    "min_training_seen_count": hit_row["training_seen_count"],
-                    "previous_training_seen_count": previous_training_seen_count,
-                    "memorized_at_first_evaluation": hit_position == 0,
-                }
-            )
-
-        first_hits = pd.DataFrame(
-            first_hit_rows,
-            columns=[
-                "run_id",
-                "distribution_id",
-                "min_training_seen_count",
-                "previous_training_seen_count",
-                "memorized_at_first_evaluation",
-            ],
+        group_columns = ["run_id", "distribution_id"]
+        ordered = eval_df.sort_values(group_columns + ["iteration"])
+        grouped = ordered.groupby(group_columns, sort=False)
+        ordered = ordered.assign(
+            previous_training_seen_count=grouped["training_seen_count"].shift(),
+            memorized_at_first_evaluation=grouped.cumcount().eq(0),
+        )
+        first_hits = (
+            ordered.loc[
+                ordered["rolling_eval_loss"] < threshold,
+                group_columns
+                + [
+                    "training_seen_count",
+                    "previous_training_seen_count",
+                    "memorized_at_first_evaluation",
+                ],
+            ]
+            .drop_duplicates(group_columns, keep="first")
+            .rename(columns={"training_seen_count": "min_training_seen_count"})
         )
         distributions = eval_df[
             ["run_id", "distribution_id", "distribution_rank"]
@@ -359,12 +360,6 @@ def _(
         f"using {loss_average_window}-eval running average for thresholding"
     )
     return eval_df, run_df
-
-
-@app.cell
-def _(eval_df, sns):
-    sns.lineplot(data=eval_df[eval_df['run_id'].eq('0000_0000-model-embed-dim-256') & eval_df['distribution_id'].isin([8000, 8001])], x='iteration', y='rolling_eval_loss', hue='distribution_id')
-    return
 
 
 @app.cell
