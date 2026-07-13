@@ -1,0 +1,48 @@
+experiment_name: distribution_vector_label_regression
+seed: 0
+device: auto
+
+run:
+  output_dir: /home/cg5763/data/output_oneshot_memorization
+  run_dir:
+  resume_from:
+
+data:
+  type: dirichlet_zipf_binary_vector_probability_vector
+  label_scheme: binary
+  num_distributions: 10000
+  num_states: 1000
+  d_label: 100
+  alpha: 0.1
+  zipf_exponent: 1.0
+  batch_size: 256
+
+model:
+  type: probability_mlp
+  vocab_size: 1000
+  num_classes: 100
+  embed_dim: 256
+  mlp_ratio: 4
+  mlp_num_layers: 2
+  dropout: 0.0
+  loss: mse
+
+optimizer:
+  type: adam
+  lr: 0.001
+  betas: [0.9, 0.999]
+  weight_decay: 0.0
+
+training:
+  max_iters: 500000
+  compile: true
+  report_interval: 10000
+  checkpoint_interval: 50000
+  grad_clip_norm:
+
+evaluation:
+  spacing: linear
+  interval: 500
+  seed: 12345
+  num_distributions: 10000
+  microbatch_size: 10000

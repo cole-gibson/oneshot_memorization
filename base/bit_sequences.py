@@ -329,6 +329,7 @@ class ProbabilityVectorClassifierMLP(nn.Module):
         mlp_ratio=4,
         mlp_num_layers=2,
         dropout=0.0,
+        loss="cross_entropy",
     ):
         super().__init__()
         if vocab_size < 1:
@@ -337,9 +338,12 @@ class ProbabilityVectorClassifierMLP(nn.Module):
             raise ValueError("num_classes must be at least 1")
         if mlp_num_layers < 0:
             raise ValueError("mlp_num_layers must be nonnegative")
+        if loss not in ("cross_entropy", "mse"):
+            raise ValueError("loss must be 'cross_entropy' or 'mse'")
 
         self.vocab_size = vocab_size
         self.embed_dim = embed_dim
+        self.loss = loss
         self.init_std = embed_dim**-0.5
         self.state_embedding = nn.Parameter(torch.empty(vocab_size, embed_dim))
         self.input_layer_norm = nn.LayerNorm(embed_dim, elementwise_affine=False)
@@ -369,5 +373,8 @@ class ProbabilityVectorClassifierMLP(nn.Module):
         logits = self.mlp(x)
         loss = None
         if targets is not None:
-            loss = F.cross_entropy(logits, targets)
+            if self.loss == "cross_entropy":
+                loss = F.cross_entropy(logits, targets)
+            else:
+                loss = F.mse_loss(logits, targets)
         return {"logits": logits, "loss": loss}

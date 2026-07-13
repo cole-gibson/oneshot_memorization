@@ -1,4 +1,7 @@
+import csv
+import tempfile
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import torch
@@ -8,8 +11,12 @@ from base.bit_sequences import (
     SequenceClassifierMLP,
     SummarySequenceClassifierMLP,
 )
-from base.data_generator import DirichletZipfBinaryProbabilityVectorGenerator
+from base.data_generator import (
+    DirichletZipfBinaryProbabilityVectorGenerator,
+    DirichletZipfBinaryVectorProbabilityVectorGenerator,
+)
 from base.train_distribution_classifier import (
+    evaluate,
     logarithmic_evaluation_iterations,
     make_compiled_training_step,
     validate_config,
@@ -220,6 +227,115 @@ class ProbabilityVectorSettingTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "requires model.type"):
             validate_config(config)
+
+
+class ProbabilityVectorLabelRegressionSettingTest(unittest.TestCase):
+    @staticmethod
+    def make_vector_label_config():
+        config = make_config()
+        config["data"] = {
+            "type": "dirichlet_zipf_binary_vector_probability_vector",
+            "label_scheme": "binary",
+            "num_distributions": 5,
+            "num_states": 7,
+            "d_label": 3,
+        }
+        config["model"] = {
+            "type": "probability_mlp",
+            "vocab_size": 7,
+            "num_classes": 3,
+            "loss": "mse",
+        }
+        config["evaluation"] = {"interval": 1}
+        return config
+
+    def test_generator_returns_selected_signed_vector_labels(self):
+        distributions = torch.tensor([[0.8, 0.2], [0.1, 0.9]])
+        labels = torch.tensor([[1.0, -1.0, 1.0], [-1.0, -1.0, 1.0]])
+        generator = DirichletZipfBinaryVectorProbabilityVectorGenerator(
+            num_distributions=2,
+            num_states=2,
+            d_label=3,
+            alpha=1.0,
+            zipf_exponent=0.0,
+            distributions=distributions,
+            distribution_labels=labels,
+        )
+
+        probabilities, distribution_ids, sampled_labels = generator.sample(
+            batch_size=8,
+            return_distribution_ids=True,
+            return_labels=True,
+        )
+
+        torch.testing.assert_close(probabilities, distributions[distribution_ids])
+        torch.testing.assert_close(sampled_labels, labels[distribution_ids])
+
+    def test_probability_model_uses_mse_for_vector_targets(self):
+        model = ProbabilityVectorClassifierMLP(
+            vocab_size=3,
+            num_classes=2,
+            embed_dim=4,
+            mlp_num_layers=0,
+            loss="mse",
+        )
+        probabilities = torch.tensor([[0.2, 0.3, 0.5]])
+        targets = torch.tensor([[1.0, -1.0]])
+
+        result = model(probabilities, targets=targets)
+
+        torch.testing.assert_close(
+            result["loss"],
+            torch.nn.functional.mse_loss(result["logits"], targets),
+        )
+
+    def test_config_requires_mse_and_matching_label_dimension(self):
+        config = self.make_vector_label_config()
+        validate_config(config)
+
+        config["model"]["loss"] = "cross_entropy"
+        with self.assertRaisesRegex(ValueError, "model.loss 'mse'"):
+            validate_config(config)
+
+        config = self.make_vector_label_config()
+        config["model"]["num_classes"] = 2
+        with self.assertRaisesRegex(ValueError, "label dimension"):
+            validate_config(config)
+
+    def test_evaluation_logs_per_distribution_signed_accuracy(self):
+        class FixedModel(torch.nn.Module):
+            def forward(self, inputs):
+                return {"logits": inputs}
+
+        model = FixedModel()
+        model.train()
+        eval_batch = {
+            "tokens": torch.tensor([[0.2, -0.5, 0.0], [-0.1, 0.7, 0.9]]),
+            "labels": torch.tensor([[1.0, -1.0, 1.0], [1.0, 1.0, 1.0]]),
+            "distribution_ids": torch.tensor([0, 1]),
+        }
+        config = self.make_vector_label_config()
+
+        with tempfile.TemporaryDirectory() as directory:
+            log_path = Path(directory) / "eval.csv"
+            evaluate(
+                model=model,
+                data_generator=None,
+                config=config,
+                eval_batch=eval_batch,
+                presentation_counts=torch.tensor([4, 2]),
+                log_path=log_path,
+                iteration=7,
+                amp_dtype=None,
+            )
+            with log_path.open(newline="") as file:
+                rows = list(csv.DictReader(file))
+
+        self.assertEqual(
+            [row["accuracy"] for row in rows],
+            ["0.66666669", "0.33333334"],
+        )
+        self.assertTrue(model.training)
 
 
 class BitSequenceSettingTest(unittest.TestCase):

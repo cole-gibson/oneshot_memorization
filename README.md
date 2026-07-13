@@ -13,6 +13,11 @@ The current focus is classification under Zipf-distributed task frequencies.
   `data.type: dirichlet_zipf_binary_probability_vector` with
   `model.type: probability_mlp` to classify component probability vectors
   directly.
+- `data.type: dirichlet_zipf_binary_vector_probability_vector` modifies the
+  probability-vector setting by assigning each distribution a fixed
+  `d_label`-dimensional label in `{−1,+1}^d_label`. The model is trained with
+  mean-squared error and evaluated by the normalized signed overlap
+  `mean(sign(prediction) * label)`.
 - The same trainer accepts `data.type: zipf_bit_binary` with
   `model.type: bit_sequence_mlp`. This setting samples a fixed collection of
   unique N-bit vectors from a Zipf prior and predicts their random binary labels.
@@ -23,7 +28,8 @@ The current focus is classification under Zipf-distributed task frequencies.
   binary sequences interactively.
 
 Runnable examples are provided in `sample_configs/distribution_classifier.yaml`,
-`sample_configs/distribution_vector_classifier.yaml`, and
+`sample_configs/distribution_vector_classifier.yaml`,
+`sample_configs/distribution_vector_label_regression.yaml`, and
 `sample_configs/bit_sequence_classifier.yaml`. Run one with, for example:
 
 ```bash

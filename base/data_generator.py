@@ -326,6 +326,67 @@ class DirichletZipfBinaryProbabilityVectorGenerator(
         return probabilities
 
 
+class DirichletZipfBinaryVectorProbabilityVectorGenerator(
+    DirichletZipfBinaryProbabilityVectorGenerator
+):
+    """Generate probability vectors with fixed random signed-vector labels."""
+
+    def __init__(
+        self,
+        num_distributions,
+        num_states,
+        d_label,
+        alpha,
+        zipf_exponent,
+        device=None,
+        dtype=torch.float32,
+        generator=None,
+        distributions=None,
+        distribution_labels=None,
+    ):
+        if (
+            not isinstance(d_label, int)
+            or isinstance(d_label, bool)
+            or d_label < 1
+        ):
+            raise ValueError("d_label must be a positive integer")
+        self.d_label = d_label
+        if distribution_labels is None:
+            distribution_labels = 2 * torch.randint(
+                0,
+                2,
+                (num_distributions, self.d_label),
+                device=device,
+                generator=generator,
+            ) - 1
+        super().__init__(
+            num_distributions=num_distributions,
+            num_states=num_states,
+            alpha=alpha,
+            zipf_exponent=zipf_exponent,
+            device=device,
+            dtype=dtype,
+            generator=generator,
+            distributions=distributions,
+            distribution_labels=distribution_labels,
+        )
+
+    def _make_distribution_labels(self, distribution_labels):
+        distribution_labels = torch.as_tensor(
+            distribution_labels,
+            device=self.device,
+        )
+        expected_shape = (self.num_distributions, self.d_label)
+        if distribution_labels.shape != expected_shape:
+            raise ValueError(
+                "distribution_labels must have shape "
+                "(num_distributions, d_label)"
+            )
+        if not torch.all((distribution_labels == -1) | (distribution_labels == 1)):
+            raise ValueError("distribution_labels must contain only -1 and +1")
+        return distribution_labels.to(dtype=self.dtype)
+
+
 if __name__ == "__main__":
     generator = DirichletZipfSequenceGenerator(
         num_distributions=100,

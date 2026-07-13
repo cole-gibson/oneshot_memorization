@@ -19,6 +19,7 @@ from base.bit_sequences import (
 from base.data_generator import (
     DirichletZipfBinaryClassificationGenerator,
     DirichletZipfBinaryProbabilityVectorGenerator,
+    DirichletZipfBinaryVectorProbabilityVectorGenerator,
 )
 from base.training_utils import (
     append_csv,
@@ -43,15 +44,23 @@ DATA_TYPES = {
     "dirichlet_zipf_binary_probability_vector": (
         DirichletZipfBinaryProbabilityVectorGenerator
     ),
+    "dirichlet_zipf_binary_vector_probability_vector": (
+        DirichletZipfBinaryVectorProbabilityVectorGenerator
+    ),
     "zipf_bit_binary": ZipfBitSequenceGenerator,
 }
 
 PROBABILITY_VECTOR_DATA_TYPE = "dirichlet_zipf_binary_probability_vector"
+VECTOR_LABEL_DATA_TYPE = "dirichlet_zipf_binary_vector_probability_vector"
 BIT_SEQUENCE_DATA_TYPE = "zipf_bit_binary"
 
 
 def is_bit_sequence_config(config):
     return config["data"]["type"] == BIT_SEQUENCE_DATA_TYPE
+
+
+def is_vector_label_config(config):
+    return config["data"]["type"] == VECTOR_LABEL_DATA_TYPE
 
 
 def num_tasks(config):
@@ -82,11 +91,15 @@ def validate_config(config):
         raise ValueError(f"unknown model.type {model.get('type')!r}")
     if data.get("type") not in DATA_TYPES:
         raise ValueError(f"unknown data.type {data.get('type')!r}")
-    is_probability_vector = data["type"] == PROBABILITY_VECTOR_DATA_TYPE
+    is_probability_vector = data["type"] in (
+        PROBABILITY_VECTOR_DATA_TYPE,
+        VECTOR_LABEL_DATA_TYPE,
+    )
     is_bit_sequence = data["type"] == BIT_SEQUENCE_DATA_TYPE
     expected_model_type = {
         "dirichlet_zipf_binary": "summary_mlp",
         PROBABILITY_VECTOR_DATA_TYPE: "probability_mlp",
+        VECTOR_LABEL_DATA_TYPE: "probability_mlp",
         BIT_SEQUENCE_DATA_TYPE: "bit_sequence_mlp",
     }[data["type"]]
     if model["type"] != expected_model_type:
@@ -104,8 +117,22 @@ def validate_config(config):
     label_scheme = data.get("label_scheme", "binary")
     if label_scheme not in ("binary", "identity"):
         raise ValueError("data.label_scheme must be 'binary' or 'identity'")
-    expected_classes = 2 if label_scheme == "binary" else num_tasks(config)
+    if is_vector_label_config(config):
+        d_label = data.get("d_label")
+        if not isinstance(d_label, int) or isinstance(d_label, bool) or d_label < 1:
+            raise ValueError("data.d_label must be a positive integer")
+        if label_scheme != "binary":
+            raise ValueError("vector labels require data.label_scheme 'binary'")
+        if model.get("loss") != "mse":
+            raise ValueError("vector labels require model.loss 'mse'")
+        expected_classes = d_label
+    else:
+        expected_classes = 2 if label_scheme == "binary" else num_tasks(config)
     if model.get("num_classes", expected_classes) != expected_classes:
+        if is_vector_label_config(config):
+            raise ValueError(
+                "model.num_classes must match the configured label dimension"
+            )
         raise ValueError(
             "model.num_classes must be 2 for binary labels or "
             "the number of tasks for identity labels"
@@ -355,7 +382,10 @@ def make_eval_batch(data_generator, config, eval_generator):
     ids = torch.arange(num_distributions, device=data_generator.device)
     ids = ids.repeat_interleave(seqs_per_distribution)
 
-    if config["data"]["type"] == PROBABILITY_VECTOR_DATA_TYPE:
+    if config["data"]["type"] in (
+        PROBABILITY_VECTOR_DATA_TYPE,
+        VECTOR_LABEL_DATA_TYPE,
+    ):
         inputs, binary_labels = data_generator.sample_from_distribution_ids(
             ids,
             return_labels=True,
@@ -395,6 +425,34 @@ def evaluate(
     inputs = eval_batch["tokens"]
     labels = eval_batch["labels"]
     ids = eval_batch["distribution_ids"]
+    if is_vector_label_config(config):
+        accuracies = []
+        microbatch = config["evaluation"].get("microbatch_size", ids.numel())
+        for start in range(0, ids.numel(), microbatch):
+            stop = min(start + microbatch, ids.numel())
+            with autocast_context(inputs.device, amp_dtype):
+                predictions = model(inputs[start:stop])["logits"]
+            accuracies.append(
+                (predictions.sign() * labels[start:stop]).mean(dim=1)
+            )
+        accuracies = torch.cat(accuracies).cpu()
+        counts_cpu = presentation_counts[: ids.numel()].cpu()
+        rows = [
+            {
+                "iter": iteration,
+                "distribution_id": distribution_id,
+                "accuracy": f"{accuracies[distribution_id].item():.8f}",
+                "training_seen_count": int(counts_cpu[distribution_id].item()),
+            }
+            for distribution_id in range(ids.numel())
+        ]
+        append_csv_rows(
+            log_path,
+            ["iter", "distribution_id", "accuracy", "training_seen_count"],
+            rows,
+        )
+        model.train()
+        return
     losses = []
     microbatch = config["evaluation"].get("microbatch_size", ids.numel())
     for start in range(0, ids.numel(), microbatch):
@@ -552,7 +610,10 @@ def main():
                 return_sequence_ids=True,
             )
             binary_labels = data_generator.labels[distribution_ids]
-        elif config["data"]["type"] == PROBABILITY_VECTOR_DATA_TYPE:
+        elif config["data"]["type"] in (
+            PROBABILITY_VECTOR_DATA_TYPE,
+            VECTOR_LABEL_DATA_TYPE,
+        ):
             inputs, distribution_ids, binary_labels = data_generator.sample(
                 batch_size=batch_size,
                 return_distribution_ids=True,
