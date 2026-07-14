@@ -36,21 +36,25 @@ def _():
 
 @app.cell
 def _(Path):
-    array_output_dir = Path(
-        # "/home/cg5763/data/output_oneshot_memorization/distribution-vector-black-chimpanzee"
-        "/home/cg5763/data/output_oneshot_memorization/bit-sequence-foamy-ape"
+    array_output_dirs = (
+        Path(
+            "/home/cg5763/data/output_oneshot_memorization/distribution-vector-label-regression-tidy-hoatzin"
+        ),
+        Path(
+            "/home/cg5763/data/output_oneshot_memorization/distribution-vector-label-regression-neon-quokka"
+        ),
     )
-    loss_threshold = 0.0001
-    loss_average_window = 1
-    initialization_exclusion_iterations = 100
+    metric_threshold = 0.9
+    metric_average_window = 1
+    initialization_exclusion_iterations = 0
     exclude_first_evaluation_memorizations = False
     rank_bin_count = 20
     return (
-        array_output_dir,
+        array_output_dirs,
         exclude_first_evaluation_memorizations,
         initialization_exclusion_iterations,
-        loss_average_window,
-        loss_threshold,
+        metric_average_window,
+        metric_threshold,
         rank_bin_count,
     )
 
@@ -124,22 +128,29 @@ def _(MODEL_TYPES, Path, torch, yaml):
 
 @app.cell
 def _(Path, pd):
-    def find_run_dirs(array_dir):
-        array_dir = Path(array_dir).expanduser()
+    def find_run_dirs(array_dirs):
+        if isinstance(array_dirs, (str, Path)):
+            array_dirs = (array_dirs,)
         run_dirs = []
-        for config_path in array_dir.rglob("config.yaml"):
-            run_dir = config_path.parent
-            if any(
-                (run_dir / filename).exists()
-                for filename in ("eval_by_distribution.csv", "eval_by_sequence.csv")
-            ):
-                run_dirs.append(run_dir)
+        for array_dir in array_dirs:
+            array_dir = Path(array_dir).expanduser()
+            for config_path in array_dir.rglob("config.yaml"):
+                run_dir = config_path.parent
+                if any(
+                    (run_dir / filename).exists()
+                    for filename in (
+                        "eval_by_distribution.csv",
+                        "eval_by_sequence.csv",
+                    )
+                ):
+                    run_dirs.append(run_dir)
         return sorted(set(run_dirs))
 
     def load_eval_csv(path):
         analysis_columns = {
             "iter",
             "loss",
+            "accuracy",
             "distribution_id",
             "sequence_id",
             "training_seen_count",
@@ -153,6 +164,7 @@ def _(Path, pd):
                 "sequence_id": "int32",
                 "training_seen_count": "int32",
                 "loss": "float64",
+                "accuracy": "float64",
             },
         )
         df = df.rename(
@@ -163,10 +175,20 @@ def _(Path, pd):
                 "sequence_id": "task_id",
             }
         )
+        metric_columns = [
+            column for column in ("eval_loss", "accuracy") if column in df.columns
+        ]
+        if len(metric_columns) != 1:
+            raise ValueError(
+                f"{path} must contain exactly one of 'loss' or 'accuracy'"
+            )
+        metric_column = metric_columns[0]
+        df["metric_name"] = metric_column
+        df["metric_value"] = df[metric_column]
         required = {
             "iteration",
             "task_id",
-            "eval_loss",
+            "metric_value",
             "training_seen_count",
         }
         missing = required - set(df.columns)
@@ -206,7 +228,7 @@ def _(
                 if path.exists()
             )
             eval_df = load_eval_csv(eval_path)
-            run_id = run_dir.name
+            run_id = str(run_dir.resolve())
             eval_df["run_id"] = run_id
             eval_df["run_dir"] = str(run_dir)
             eval_df["eval_path"] = str(eval_path)
@@ -234,7 +256,8 @@ def _(
                     "task_rank",
                     "distribution_id",
                     "distribution_rank",
-                    "eval_loss",
+                    "metric_name",
+                    "metric_value",
                     "training_seen_count",
                 ]
             )
@@ -255,7 +278,16 @@ def _(
 
 @app.cell
 def _(pd):
-    def first_below_threshold(eval_df, threshold):
+    def is_memorized(eval_df, threshold):
+        return (
+            (eval_df["metric_name"] == "accuracy")
+            & (eval_df["rolling_metric"] >= threshold)
+        ) | (
+            (eval_df["metric_name"] == "eval_loss")
+            & (eval_df["rolling_metric"] < threshold)
+        )
+
+    def first_threshold_crossing(eval_df, threshold):
         if eval_df.empty:
             return pd.DataFrame(
                 columns=[
@@ -264,6 +296,7 @@ def _(pd):
                     "distribution_rank",
                     "min_training_seen_count",
                     "previous_training_seen_count",
+                    "previous_metric_value",
                     "memorized_at_first_evaluation",
                 ]
             )
@@ -274,15 +307,17 @@ def _(pd):
         grouped = ordered.groupby(group_columns, sort=False)
         ordered = ordered.assign(
             previous_training_seen_count=grouped["training_seen_count"].shift(),
+            previous_metric_value=grouped["metric_value"].shift(),
             memorized_at_first_evaluation=grouped.cumcount().eq(0),
         )
         first_hits = (
             ordered.loc[
-                ordered["rolling_eval_loss"] < threshold,
+                is_memorized(ordered, threshold),
                 group_columns
                 + [
                     "training_seen_count",
                     "previous_training_seen_count",
+                    "previous_metric_value",
                     "memorized_at_first_evaluation",
                 ],
             ]
@@ -298,12 +333,20 @@ def _(pd):
             how="left",
         )
 
-    def final_run_metrics(eval_df, run_df, threshold):
+    def final_evaluation_metrics(eval_df, run_df, threshold):
         if eval_df.empty:
-            return run_df.assign(
-                final_loss=pd.Series(dtype="float64"),
-                max_memorized_distribution_rank=pd.Series(dtype="float64"),
+            final_eval = eval_df.assign(
+                is_memorized=pd.Series(dtype="bool"),
             )
+            final_eval = final_eval.merge(
+                run_df[["run_id", "num_parameters"]],
+                on="run_id",
+                how="left",
+            )
+            summary = run_df.assign(
+                final_memorized_fraction=pd.Series(dtype="float64"),
+            )
+            return final_eval, summary
         final_iteration = (
             eval_df.groupby("run_id")["iteration"]
             .max()
@@ -313,59 +356,80 @@ def _(pd):
         final_eval = eval_df.merge(final_iteration, on="run_id")
         final_eval = final_eval[
             final_eval["iteration"] == final_eval["final_iteration"]
-        ]
-        final_loss = (
-            final_eval.groupby("run_id", as_index=False)["eval_loss"]
+        ].copy()
+        final_eval["is_memorized"] = is_memorized(final_eval, threshold)
+        final_eval = final_eval.merge(
+            run_df[["run_id", "num_parameters"]],
+            on="run_id",
+            how="left",
+        )
+        final_fraction = (
+            final_eval.groupby("run_id", as_index=False)["is_memorized"]
             .mean()
-            .rename(columns={"eval_loss": "final_loss"})
+            .rename(columns={"is_memorized": "final_memorized_fraction"})
         )
-        memorized = final_eval[final_eval["rolling_eval_loss"] < threshold]
-        max_rank = (
-            memorized.groupby("run_id", as_index=False)["distribution_rank"]
-            .max()
-            .rename(columns={"distribution_rank": "max_memorized_distribution_rank"})
-        )
-        summary = run_df.merge(final_loss, on="run_id", how="left")
-        summary = summary.merge(max_rank, on="run_id", how="left")
-        summary["max_memorized_distribution_rank"] = summary[
-            "max_memorized_distribution_rank"
-        ].fillna(0)
-        return summary
+        summary = run_df.merge(final_fraction, on="run_id", how="left")
+        return final_eval, summary
 
-    return final_run_metrics, first_below_threshold
+    return final_evaluation_metrics, first_threshold_crossing, is_memorized
 
 
 @app.cell
 def _(
-    array_output_dir,
+    array_output_dirs,
     initialization_exclusion_iterations,
     load_array_runs,
-    loss_average_window,
+    metric_average_window,
 ):
-    eval_df, run_df = load_array_runs(array_output_dir)
+    eval_df, run_df = load_array_runs(array_output_dirs)
     loaded_eval_rows = len(eval_df)
     eval_df = eval_df[
         eval_df["iteration"] > initialization_exclusion_iterations
     ].copy()
     eval_df = eval_df.sort_values(["run_id", "distribution_id", "iteration"])
-    eval_df["rolling_eval_loss"] = eval_df.groupby(
+    eval_df["rolling_metric"] = eval_df.groupby(
         ["run_id", "distribution_id"]
-    )["eval_loss"].transform(
-        lambda loss: loss.rolling(window=loss_average_window, min_periods=1).mean()
+    )["metric_value"].transform(
+        lambda metric: metric.rolling(
+            window=metric_average_window, min_periods=1
+        ).mean()
+    )
+    metric_names = sorted(eval_df["metric_name"].unique())
+    metric_label = (
+        "Accuracy" if metric_names == ["accuracy"]
+        else "Loss" if metric_names == ["eval_loss"]
+        else "Metric"
     )
     print(
         f"loaded {len(run_df)} runs and {loaded_eval_rows} eval rows; "
         f"kept {len(eval_df)} eval rows after excluding iterations <= "
         f"{initialization_exclusion_iterations}; "
-        f"using {loss_average_window}-eval running average for thresholding"
+        f"using {metric_average_window}-eval running average for thresholding "
+        f"({', '.join(metric_names) or 'no metric'})"
     )
-    return eval_df, run_df
+    return eval_df, metric_label, run_df
 
 
 @app.cell
-def _(eval_df, first_below_threshold, loss_threshold, run_df):
+def _(eval_df, final_evaluation_metrics, metric_threshold, run_df):
+    final_eval_df, summary_df = final_evaluation_metrics(
+        eval_df,
+        run_df,
+        metric_threshold,
+    )
+    return final_eval_df, summary_df
+
+
+@app.cell
+def _(
+    eval_df,
+    first_threshold_crossing,
+    is_memorized,
+    metric_threshold,
+    run_df,
+):
     _zero_appearance_memorizations = eval_df[
-        (eval_df["rolling_eval_loss"] < loss_threshold)
+        is_memorized(eval_df, metric_threshold)
         & (eval_df["training_seen_count"] == 0)
     ][
         [
@@ -373,7 +437,8 @@ def _(eval_df, first_below_threshold, loss_threshold, run_df):
             "task_id",
             "task_rank",
             "iteration",
-            "eval_loss",
+            "metric_name",
+            "metric_value",
             "eval_path",
         ]
     ]
@@ -382,7 +447,7 @@ def _(eval_df, first_below_threshold, loss_threshold, run_df):
             "WARNING: tasks were memorized with 0 training appearances:\n"
             + _zero_appearance_memorizations.to_string(index=False)
         )
-    threshold_df = first_below_threshold(eval_df, loss_threshold)
+    threshold_df = first_threshold_crossing(eval_df, metric_threshold)
     threshold_df = threshold_df.merge(
         run_df[
             [
@@ -399,15 +464,9 @@ def _(eval_df, first_below_threshold, loss_threshold, run_df):
 
 
 @app.cell
-def _(threshold_df):
-    threshold_df.dropna(subset=["min_training_seen_count"])['distribution_rank'].max()
-    return
-
-
-@app.cell
-def _(eval_df, loss_threshold, pd, plt, run_df, sns):
+def _(eval_df, is_memorized, metric_threshold, pd, plt, run_df, sns):
     _plot_df = eval_df.copy()
-    _plot_df["is_memorized"] = _plot_df["rolling_eval_loss"] < loss_threshold
+    _plot_df["is_memorized"] = is_memorized(_plot_df, metric_threshold)
     _plot_df = (
         _plot_df.groupby(["run_id", "iteration"], as_index=False)["is_memorized"]
         .mean()
@@ -472,7 +531,7 @@ def _(np, pd, plt, rank_bin_count, sns, threshold_df):
         _plot_df["is_unmemorized"] = _plot_df["min_training_seen_count"].isna()
         _binned_df = (
             _plot_df.dropna(subset=["rank_bin"])
-            .groupby(["parameter_setting", "rank_bin"], as_index=False)
+            .groupby(["num_parameters", "rank_bin"], as_index=False)
             .agg(proportion_unmemorized=("is_unmemorized", "mean"))
         )
         _centers = 10 ** ((_bin_edges[:-1] + _bin_edges[1:]) / 2)
@@ -484,7 +543,7 @@ def _(np, pd, plt, rank_bin_count, sns, threshold_df):
             data=_binned_df,
             x="task_rank",
             y="proportion_unmemorized",
-            hue="parameter_setting",
+            hue="num_parameters",
             marker="o",
             ax=_ax,
         )
@@ -498,18 +557,14 @@ def _(np, pd, plt, rank_bin_count, sns, threshold_df):
 
 
 @app.cell
-def _(pd, plt, sns, threshold_df):
-    _plot_df = threshold_df.dropna(subset=["min_training_seen_count"]).copy()
-    _plot_df["min_training_seen_count"] = pd.to_numeric(
-        _plot_df["min_training_seen_count"]
-    )
-    _plot_df = _plot_df[_plot_df["min_training_seen_count"] > 0]
+def _(metric_label, plt, sns, threshold_df):
+    _plot_df = threshold_df.dropna(subset=["previous_metric_value"]).copy()
     if _plot_df.empty:
         _fig, _ax = plt.subplots(figsize=(7, 4))
         _ax.text(
             0.5,
             0.5,
-            "No memorized distributions",
+            "No memorized distributions with a preceding evaluation",
             ha="center",
             va="center",
             transform=_ax.transAxes,
@@ -518,8 +573,8 @@ def _(pd, plt, sns, threshold_df):
     else:
         _grid = sns.displot(
             data=_plot_df,
-            x="min_training_seen_count",
-            col="parameter_setting",
+            x="previous_metric_value",
+            col="num_parameters",
             col_wrap=2,
             bins=30,
             height=3.2,
@@ -527,15 +582,62 @@ def _(pd, plt, sns, threshold_df):
             facet_kws={"sharey": False},
         )
         _grid.set(
-            # xscale="log",
-            xlabel="Training appearances at memorization",
+            xlabel=f"{metric_label} immediately before memorization",
             ylabel="Distributions",
         )
         _grid.set_titles("{col_name}")
         _grid.fig.suptitle(
-            "Memorization time distribution by parameter setting",
+            f"Distribution of {metric_label.lower()} immediately before "
+            "memorization",
             y=1.02,
         )
+        _fig = _grid.fig
+    _fig
+    return
+
+
+@app.cell
+def _(metric_label, metric_threshold, pd, plt, sns, threshold_df):
+    _plot_df = threshold_df.dropna(subset=["previous_metric_value"]).copy()
+    _plot_df["min_training_seen_count"] = pd.to_numeric(
+        _plot_df["min_training_seen_count"]
+    )
+    _plot_df = _plot_df[_plot_df["min_training_seen_count"] == 1]
+    if _plot_df.empty:
+        _fig, _ax = plt.subplots(figsize=(7, 4))
+        _ax.text(
+            0.5,
+            0.5,
+            "No distributions memorized after one appearance\n"
+            "with a preceding evaluation",
+            ha="center",
+            va="center",
+            transform=_ax.transAxes,
+        )
+        _ax.set_axis_off()
+    else:
+        _grid = sns.displot(
+            data=_plot_df,
+            x="previous_metric_value",
+            col="num_parameters",
+            col_wrap=2,
+            bins=30,
+            height=3.2,
+            aspect=1.3,
+            facet_kws={"sharey": False},
+        )
+        _grid.set(
+            xlabel=f"{metric_label} immediately before memorization",
+            ylabel="Distributions",
+        )
+        _grid.set_titles("{col_name}")
+        _grid.fig.suptitle(
+            f"Distribution of {metric_label.lower()} immediately before "
+            "memorization after one appearance",
+            y=1.02,
+        )
+        for ax in _grid.axes.flat:
+            ax.set_xlim(-1, metric_threshold)
         _fig = _grid.fig
     _fig
     return
@@ -571,7 +673,7 @@ def _(exclude_first_evaluation_memorizations, pd, plt, sns, threshold_df):
             data=_plot_df,
             x="distribution_rank",
             y="min_training_seen_count",
-            col="parameter_setting",
+            col="num_parameters",
             col_wrap=2,
             kind="scatter",
             marker=".",
@@ -581,7 +683,7 @@ def _(exclude_first_evaluation_memorizations, pd, plt, sns, threshold_df):
             aspect=1.3,
         )
         for _setting, _ax in _grid.axes_dict.items():
-            _facet_df = _plot_df[_plot_df["parameter_setting"].eq(_setting)]
+            _facet_df = _plot_df[_plot_df["num_parameters"].eq(_setting)]
             _ax.errorbar(
                 _facet_df["distribution_rank"],
                 _facet_df["min_training_seen_count"],
@@ -603,7 +705,7 @@ def _(exclude_first_evaluation_memorizations, pd, plt, sns, threshold_df):
         )
         _grid.set_titles("{col_name}")
         _grid.fig.suptitle(
-            "Appearances needed to cross loss threshold",
+            "Appearances needed to cross metric threshold",
             y=1.02,
         )
         _fig = _grid.fig
@@ -666,7 +768,7 @@ def _(
         _bin_centers = 10 ** ((_bin_edges[:-1] + _bin_edges[1:]) / 2)
 
         _binned_df = (
-            _plot_df.groupby(["parameter_setting", "rank_bin"], as_index=False)
+            _plot_df.groupby(["num_parameters", "rank_bin"], as_index=False)
             .agg(
                 mean_training_seen_count=("min_training_seen_count", "mean"),
                 std_training_seen_count=("min_training_seen_count", "std"),
@@ -682,10 +784,10 @@ def _(
 
         _fig, _ax = plt.subplots(figsize=(8, 5))
         _palette = sns.color_palette(
-            n_colors=_binned_df["parameter_setting"].nunique()
+            n_colors=_binned_df["num_parameters"].nunique()
         )
         for (_setting, _setting_df), _color in zip(
-            _binned_df.groupby("parameter_setting"),
+            _binned_df.groupby("num_parameters"),
             _palette,
         ):
             _ax.errorbar(
@@ -702,34 +804,9 @@ def _(
         _ax.set_yscale("log")
         _ax.set_xlabel("Distribution rank bin center")
         _ax.set_ylabel("Mean minimum training appearances")
-        _ax.set_title("Binned appearances needed to cross loss threshold")
-        _ax.legend(title="Parameter setting")
-    _fig
-    return
-
-
-@app.cell
-def _(eval_df, final_run_metrics, loss_threshold, run_df):
-    summary_df = final_run_metrics(eval_df, run_df, loss_threshold)
-    summary_df.sort_values("num_parameters").head()
-    return (summary_df,)
-
-
-@app.cell
-def _(plt, sns, summary_df):
-    _fig, _ax = plt.subplots(figsize=(7, 5))
-    sns.scatterplot(
-        data=summary_df,
-        x="num_parameters",
-        y="final_loss",
-        hue="parameter_setting",
-        ax=_ax,
-    )
-    _ax.set_xscale("log")
-    _ax.set_xlabel("Number of parameters")
-    _ax.set_yscale("log")
-    _ax.set_ylabel("Final loss")
-    _ax.set_title("Final loss by model size")
+        _ax.set_title("Binned appearances needed to cross metric threshold")
+        _ax.legend(title="P")
+        _ax.set_aspect("equal")
     _fig
     return
 
@@ -737,17 +814,117 @@ def _(plt, sns, summary_df):
 @app.cell
 def _(plt, sns, summary_df):
     _fig, _ax = plt.subplots(figsize=(7, 5))
-    sns.scatterplot(
+    sns.lineplot(
         data=summary_df,
         x="num_parameters",
-        y="max_memorized_distribution_rank",
-        hue="parameter_setting",
+        y="final_memorized_fraction",
+        marker="o",
         ax=_ax,
     )
     _ax.set_xscale("log")
+    _ax.set_ylim(-0.02, 1.02)
     _ax.set_xlabel("Number of parameters")
-    _ax.set_ylabel("Maximum memorized distribution rank")
-    _ax.set_title("Memorized rank by model size")
+    _ax.set_ylabel("Final memorized fraction")
+    _ax.set_title("Final memorized fraction by model size")
+    _fig
+    return
+
+
+@app.cell
+def _(final_eval_df, metric_label, np, plt, sns, threshold_df):
+    _memorized_distributions = threshold_df.dropna(
+        subset=["min_training_seen_count"]
+    )[["run_id", "distribution_id"]]
+    _plot_df = final_eval_df.merge(
+        _memorized_distributions,
+        on=["run_id", "distribution_id"],
+        how="inner",
+    ).dropna(
+        subset=["num_parameters"]
+    )
+    if _plot_df.empty:
+        _fig, _ax = plt.subplots(figsize=(7, 4))
+        _ax.text(
+            0.5,
+            0.5,
+            "No distributions reached the memorization threshold",
+            ha="center",
+            va="center",
+            transform=_ax.transAxes,
+        )
+        _ax.set_axis_off()
+    else:
+        _grid = sns.displot(
+            data=_plot_df,
+            x="metric_value",
+            col="num_parameters",
+            col_wrap=2,
+            bins=np.linspace(-1, 1, 21),
+            height=3.2,
+            aspect=1.3,
+            facet_kws={"sharey": False},
+        )
+        _grid.set(
+            xlabel=f"Final {metric_label.lower()}",
+            ylabel="Memorized distributions",
+            xlim=(-1, 1)
+        )
+        _grid.set_titles("{col_name} parameters")
+        _grid.fig.suptitle(
+            f"Final {metric_label.lower()} for distributions memorized "
+            "during training",
+            y=1.02,
+        )
+        _fig = _grid.fig
+    _fig
+    return
+
+
+@app.cell
+def _(final_eval_df, metric_label, np, plt, sns, threshold_df):
+    _memorized_distributions = threshold_df[threshold_df["min_training_seen_count"].isin([1])].dropna(
+        subset=["min_training_seen_count"]
+    )[["run_id", "distribution_id"]]
+    _plot_df = final_eval_df.merge(
+        _memorized_distributions,
+        on=["run_id", "distribution_id"],
+        how="inner",
+    ).dropna(
+        subset=["num_parameters"]
+    )
+    if _plot_df.empty:
+        _fig, _ax = plt.subplots(figsize=(7, 4))
+        _ax.text(
+            0.5,
+            0.5,
+            "No distributions reached the memorization threshold",
+            ha="center",
+            va="center",
+            transform=_ax.transAxes,
+        )
+        _ax.set_axis_off()
+    else:
+        _grid = sns.displot(
+            data=_plot_df,
+            x="metric_value",
+            col="num_parameters",
+            col_wrap=2,
+            bins=np.linspace(-1, 1, 21),
+            height=3.2,
+            aspect=1.3,
+            facet_kws={"sharey": False},
+        )
+        _grid.set(
+            xlabel=f"Final {metric_label.lower()}",
+            ylabel="Memorized distributions",
+            xlim=(-1, 1)
+        )
+        _grid.set_titles("{col_name} parameters")
+        _grid.fig.suptitle(
+            f"Final {metric_label.lower()} for distributions memorized after 1 appearance",
+            y=1.02,
+        )
+        _fig = _grid.fig
     _fig
     return
 
