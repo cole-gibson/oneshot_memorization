@@ -9,28 +9,28 @@ import yaml
 
 ###########
 
-REFERENCE_CONFIG = Path("sample_configs/bit_sequence_classifier.yaml")
-OUTPUT_DIR = Path("configs/bit_sequence_smaller")
-SWEEP = [
-    (("training.max_iters"), [50000]),
-    (("training.report_interval"), [1000]),
-    (("training.checkpoint_interval"), [1000]),
+# REFERENCE_CONFIG = Path("sample_configs/bit_sequence_classifier.yaml")
+# OUTPUT_DIR = Path("configs/bit_sequence_smaller")
+# SWEEP = [
+#     (("training.max_iters"), [50000]),
+#     (("training.report_interval"), [1000]),
+#     (("training.checkpoint_interval"), [1000]),
 
-    (("data.num_sequences"), [100000]),
-    (("data.batch_size"), [256]),
+#     (("data.num_sequences"), [100000]),
+#     (("data.batch_size"), [256]),
 
-    # (("model.hidden_dim"), [1024, 2048, 4096, 8192]),
-    (("model.hidden_dim"), [128, 256, 512]),
+#     # (("model.hidden_dim"), [1024, 2048, 4096, 8192]),
+#     (("model.hidden_dim"), [128, 256, 512]),
 
-    (("evaluation.spacing"), ['logarithmic']),
-    (("evaluation.points_per_decade"), [10]),
-    (("evaluation.interval"), [None]),
-    (("evaluation.num_sequences"), [100000]),
-    (("evaluation.microbatch_size"), [100000])
-]
-EXPERIMENT_NAME = 'bit_sequence'
-DESCRIPTION = None
-OVERWRITE = True
+#     (("evaluation.spacing"), ['logarithmic']),
+#     (("evaluation.points_per_decade"), [10]),
+#     (("evaluation.interval"), [None]),
+#     (("evaluation.num_sequences"), [100000]),
+#     (("evaluation.microbatch_size"), [100000])
+# ]
+# EXPERIMENT_NAME = 'bit_sequence'
+# DESCRIPTION = None
+# OVERWRITE = True
 
 ############
 
@@ -56,6 +56,57 @@ OVERWRITE = True
 # DESCRIPTION = None
 # OVERWRITE = True
 
+############
+
+# REFERENCE_CONFIG = Path("sample_configs/distribution_vector_label_regression.yaml")
+# OUTPUT_DIR = Path("configs/distribution_vector_label_regression_add")
+# SWEEP = [
+#     (("training.max_iters"), [100000]),
+#     (("training.report_interval"), [10000]),
+#     (("training.checkpoint_interval"), [10000]),
+
+#     (("data.num_distributions"), [100000]),
+#     (("data.num_states", "model.vocab_size"), [100]),
+#     (("data.alpha"), [1.0]),
+#     (("data.batch_size"), [256]),
+#     (("data.d_label", "model.num_classes"), [32]),
+
+#     (("model.embed_dim"), [90, 181, 362, 724, 1448]),
+
+#     (("evaluation.spacing"), ['logarithmic']),
+#     (("evaluation.points_per_decade"), [10]),
+#     (("evaluation.interval"), [None]),
+#     (("evaluation.num_distributions"), [100000]),
+#     (("evaluation.microbatch_size"), [100000])
+# ]
+# EXPERIMENT_NAME = 'test_distribution_vector_label_regression'
+# DESCRIPTION = None
+# OVERWRITE = True
+
+REFERENCE_CONFIG = Path("sample_configs/distribution_vector_autoencoder.yaml")
+OUTPUT_DIR = Path("configs/distribution_vector_autoencoder_add")
+SWEEP = [
+    (("training.max_iters"), [100000]),
+    (("training.report_interval"), [10000]),
+    (("training.checkpoint_interval"), [10000]),
+
+    (("data.num_distributions"), [100000]),
+    (("data.num_states", "model.vocab_size"), [1000]),
+    (("data.alpha"), [1.0]),
+    (("data.batch_size"), [256]),
+
+    (("model.embed_dim"), [724]),
+    (("model.mlp_ratio"), [32, 64]),
+
+    (("evaluation.spacing"), ['logarithmic']),
+    (("evaluation.points_per_decade"), [10]),
+    (("evaluation.interval"), [None]),
+    (("evaluation.num_distributions"), [100000]),
+    (("evaluation.microbatch_size"), [100000])
+]
+EXPERIMENT_NAME = 'distribution_vector_autoencoder'
+DESCRIPTION = None
+OVERWRITE = True
 
 def load_yaml(path):
     with path.open("r", encoding="utf-8") as f:
