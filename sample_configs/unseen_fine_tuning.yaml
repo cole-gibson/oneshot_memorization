@@ -1,0 +1,24 @@
+experiment_name: unseen_fine_tuning
+seed: 123
+device: auto
+
+fine_tuning:
+  num_unseen_items: 16
+  max_iters: 1000
+  checkpoint_iterations:
+  log_interval: 1
+  report_interval: 100
+  grad_clip_norm:
+
+# These values override the optimizer from each source training run.
+optimizer:
+  lr: 0.001
+
+# Omit this section to reuse the source run's evaluation schedule.
+evaluation:
+  spacing: linear
+  interval: 1
+
+# For loss, stop when value <= threshold. For accuracy, stop at >= threshold.
+early_stopping:
+  threshold: 0.01
