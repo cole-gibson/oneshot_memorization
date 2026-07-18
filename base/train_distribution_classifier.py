@@ -101,6 +101,18 @@ def validate_config(config):
         PROBABILITY_VECTOR_DATA_TYPE,
         VECTOR_LABEL_DATA_TYPE,
     )
+    if is_probability_vector:
+        if not isinstance(data.get("noise_enabled", False), bool):
+            raise ValueError("data.noise_enabled must be a boolean")
+        noise_intensity = data.get("noise_intensity", 1.0)
+        if (
+            not isinstance(noise_intensity, (int, float))
+            or isinstance(noise_intensity, bool)
+            or noise_intensity < 0
+        ):
+            raise ValueError(
+                "data.noise_intensity must be a nonnegative number"
+            )
     is_bit_sequence = data["type"] == BIT_SEQUENCE_DATA_TYPE
     allowed_model_types = {
         "dirichlet_zipf_binary": "summary_mlp",
@@ -421,10 +433,15 @@ def make_eval_batch(data_generator, config, eval_generator):
         PROBABILITY_VECTOR_DATA_TYPE,
         VECTOR_LABEL_DATA_TYPE,
     ):
-        inputs, binary_labels = data_generator.sample_from_distribution_ids(
-            ids,
-            return_labels=True,
-        )
+        train_generator = data_generator.generator
+        data_generator.generator = eval_generator
+        try:
+            inputs, binary_labels = data_generator.sample_from_distribution_ids(
+                ids,
+                return_labels=True,
+            )
+        finally:
+            data_generator.generator = train_generator
     else:
         train_generator = data_generator.generator
         data_generator.generator = eval_generator
@@ -442,7 +459,13 @@ def make_eval_batch(data_generator, config, eval_generator):
         else binary_labels
     )
     # Keep the existing checkpoint key for backward-compatible resume behavior.
-    return {"tokens": inputs, "labels": labels, "distribution_ids": ids}
+    batch = {"tokens": inputs, "labels": labels, "distribution_ids": ids}
+    if (
+        is_probability_autoencoder_config(config)
+        and config["data"].get("noise_enabled", False)
+    ):
+        batch["targets"] = data_generator.distributions[ids]
+    return batch
 
 
 @torch.no_grad()
@@ -489,6 +512,7 @@ def evaluate(
         model.train()
         return
     if is_probability_autoencoder_config(config):
+        targets = eval_batch.get("targets", inputs)
         losses = []
         microbatch = config["evaluation"].get("microbatch_size", ids.numel())
         for start in range(0, ids.numel(), microbatch):
@@ -497,7 +521,7 @@ def evaluate(
                 losses.append(
                     model(
                         inputs[start:stop],
-                        targets=inputs[start:stop],
+                        targets=targets[start:stop],
                         loss_reduction="none",
                     )["loss"]
                 )
@@ -703,7 +727,14 @@ def main():
             if config["data"].get("label_scheme", "binary") == "identity"
             else binary_labels
         )
-        targets = inputs if is_probability_autoencoder_config(config) else labels
+        if is_probability_autoencoder_config(config):
+            targets = (
+                data_generator.distributions[distribution_ids]
+                if config["data"].get("noise_enabled", False)
+                else inputs
+            )
+        else:
+            targets = labels
         presentation_counts += torch.bincount(
             distribution_ids,
             minlength=num_tasks(config),

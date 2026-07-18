@@ -16,11 +16,13 @@ data:
   alpha: 0.1
   zipf_exponent: 1.0
   batch_size: 256
+  noise_enabled: false
+  noise_intensity: 1.0
 
 model:
   type: probability_mlp
   vocab_size: 1000
-  num_classes: 100
+  num_classes: 32
   embed_dim: 256
   mlp_ratio: 4
   mlp_num_layers: 2

@@ -177,7 +177,7 @@ def sample_normal_batch(data_generator, config, batch_size):
         PROBABILITY_VECTOR_DATA_TYPE,
         VECTOR_LABEL_DATA_TYPE,
     ):
-        inputs, _, labels = data_generator.sample(
+        inputs, distribution_ids, labels = data_generator.sample(
             batch_size=batch_size,
             return_distribution_ids=True,
             return_labels=True,
@@ -189,7 +189,14 @@ def sample_normal_batch(data_generator, config, batch_size):
             return_distribution_ids=True,
             return_labels=True,
         )
-    targets = inputs if is_probability_autoencoder_config(config) else labels
+    if is_probability_autoencoder_config(config):
+        targets = (
+            data_generator.distributions[distribution_ids]
+            if config["data"].get("noise_enabled", False)
+            else inputs
+        )
+    else:
+        targets = labels
     return inputs, targets
 
 
@@ -209,7 +216,14 @@ def sample_unseen_item(data_generator, config, item_id, count=1):
             sequence_length=config["data"]["sequence_length"],
             return_labels=True,
         )
-    targets = inputs if is_probability_autoencoder_config(config) else labels
+    if is_probability_autoencoder_config(config):
+        targets = (
+            data_generator.distributions[ids]
+            if config["data"].get("noise_enabled", False)
+            else inputs
+        )
+    else:
+        targets = labels
     return inputs, targets
 
 

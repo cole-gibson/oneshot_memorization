@@ -269,6 +269,32 @@ class DirichletZipfBinaryProbabilityVectorGenerator(
 ):
     """Generate probability-vector/label pairs from Zipf-selected components."""
 
+    def __init__(self, *args, noise_enabled=False, noise_intensity=1.0, **kwargs):
+        if not isinstance(noise_enabled, bool):
+            raise ValueError("noise_enabled must be a boolean")
+        if (
+            not isinstance(noise_intensity, (int, float))
+            or isinstance(noise_intensity, bool)
+            or noise_intensity < 0
+        ):
+            raise ValueError("noise_intensity must be a nonnegative number")
+        self.noise_enabled = noise_enabled
+        self.noise_intensity = float(noise_intensity)
+        super().__init__(*args, **kwargs)
+
+    def _add_noise(self, probabilities):
+        standard_normal = torch.randn(
+            probabilities.shape,
+            device=self.device,
+            dtype=self.dtype,
+            generator=self.generator,
+        )
+        scaled_normal = probabilities.sqrt() * standard_normal
+        noise = scaled_normal - probabilities * scaled_normal.sum(
+            dim=-1, keepdim=True
+        )
+        return probabilities + self.noise_intensity * noise
+
     @torch.no_grad()
     def sample(
         self,
@@ -286,6 +312,8 @@ class DirichletZipfBinaryProbabilityVectorGenerator(
             generator=self.generator,
         )
         probabilities = self.distributions[distribution_ids]
+        if self.noise_enabled:
+            probabilities = self._add_noise(probabilities)
         labels = self.distribution_labels[distribution_ids]
 
         if return_distribution_ids and return_labels:
@@ -321,6 +349,8 @@ class DirichletZipfBinaryProbabilityVectorGenerator(
             )
 
         probabilities = self.distributions[distribution_ids]
+        if self.noise_enabled:
+            probabilities = self._add_noise(probabilities)
         if return_labels:
             return probabilities, self.distribution_labels[distribution_ids]
         return probabilities
@@ -343,6 +373,8 @@ class DirichletZipfBinaryVectorProbabilityVectorGenerator(
         generator=None,
         distributions=None,
         distribution_labels=None,
+        noise_enabled=False,
+        noise_intensity=1.0,
     ):
         if (
             not isinstance(d_label, int)
@@ -369,6 +401,8 @@ class DirichletZipfBinaryVectorProbabilityVectorGenerator(
             generator=generator,
             distributions=distributions,
             distribution_labels=distribution_labels,
+            noise_enabled=noise_enabled,
+            noise_intensity=noise_intensity,
         )
 
     def _make_distribution_labels(self, distribution_labels):

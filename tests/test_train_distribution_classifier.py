@@ -20,6 +20,7 @@ from base.train_distribution_classifier import (
     evaluate,
     logarithmic_evaluation_iterations,
     logarithmic_iterations,
+    make_eval_batch,
     make_compiled_training_step,
     validate_config,
 )
@@ -218,6 +219,56 @@ class ProbabilityVectorSettingTest(unittest.TestCase):
         torch.testing.assert_close(probabilities, distributions[distribution_ids])
         torch.testing.assert_close(sampled_labels, labels[distribution_ids])
 
+    def test_generator_adds_fresh_categorical_covariance_noise(self):
+        distributions = torch.tensor([[0.2, 0.3, 0.5]])
+        generator = DirichletZipfBinaryProbabilityVectorGenerator(
+            num_distributions=1,
+            num_states=3,
+            alpha=1.0,
+            zipf_exponent=0.0,
+            distributions=distributions,
+            distribution_labels=torch.tensor([1]),
+            noise_enabled=True,
+            noise_intensity=0.4,
+            generator=torch.Generator().manual_seed(0),
+        )
+        ids = torch.zeros(100_000, dtype=torch.long)
+
+        first = generator.sample_from_distribution_ids(ids)
+        second = generator.sample_from_distribution_ids(ids)
+        noise = (first - distributions[0]) / 0.4
+        empirical_covariance = noise.T.cov()
+        expected_covariance = torch.diag(distributions[0]) - torch.outer(
+            distributions[0], distributions[0]
+        )
+
+        self.assertFalse(torch.equal(first, second))
+        torch.testing.assert_close(
+            first.sum(dim=-1), torch.ones(ids.numel()), atol=2e-6, rtol=0
+        )
+        torch.testing.assert_close(
+            empirical_covariance, expected_covariance, atol=3e-3, rtol=0
+        )
+
+    def test_generator_bypasses_noise_when_disabled(self):
+        distributions = torch.tensor([[0.2, 0.3, 0.5]])
+        generator = DirichletZipfBinaryProbabilityVectorGenerator(
+            num_distributions=1,
+            num_states=3,
+            alpha=1.0,
+            zipf_exponent=0.0,
+            distributions=distributions,
+            distribution_labels=torch.tensor([1]),
+            noise_enabled=False,
+        )
+
+        with mock.patch.object(
+            generator, "_add_noise", side_effect=AssertionError("noise generated")
+        ):
+            actual = generator.sample_from_distribution_ids(torch.tensor([0]))
+
+        torch.testing.assert_close(actual, distributions)
+
     def test_model_uses_probability_weighted_state_embedding(self):
         model = ProbabilityVectorClassifierMLP(
             vocab_size=3,
@@ -282,6 +333,41 @@ class ProbabilityVectorAutoencoderSettingTest(unittest.TestCase):
 
     def test_config_accepts_probability_vector_autoencoder(self):
         validate_config(self.make_autoencoder_config())
+
+    def test_noised_eval_inputs_keep_clean_autoencoder_targets(self):
+        config = self.make_autoencoder_config()
+        config["data"].update({"noise_enabled": True, "noise_intensity": 0.4})
+        config["data"].update({"num_distributions": 2, "num_states": 3})
+        config["model"]["vocab_size"] = 3
+        distributions = torch.tensor([[0.2, 0.3, 0.5], [0.6, 0.1, 0.3]])
+        generator = DirichletZipfBinaryProbabilityVectorGenerator(
+            num_distributions=2,
+            num_states=3,
+            alpha=1.0,
+            zipf_exponent=0.0,
+            distributions=distributions,
+            distribution_labels=torch.tensor([0, 1]),
+            noise_enabled=True,
+            noise_intensity=0.4,
+        )
+
+        batch = make_eval_batch(
+            generator, config, torch.Generator().manual_seed(0)
+        )
+
+        self.assertFalse(torch.equal(batch["tokens"], distributions))
+        torch.testing.assert_close(batch["targets"], distributions)
+
+    def test_noise_config_values_are_validated(self):
+        config = self.make_autoencoder_config()
+        config["data"]["noise_enabled"] = "yes"
+        with self.assertRaisesRegex(ValueError, "noise_enabled"):
+            validate_config(config)
+
+        config = self.make_autoencoder_config()
+        config["data"]["noise_intensity"] = -0.1
+        with self.assertRaisesRegex(ValueError, "noise_intensity"):
+            validate_config(config)
 
     def test_model_reconstruction_loss_is_kl_divergence(self):
         model = ProbabilityVectorAutoencoderMLP(
