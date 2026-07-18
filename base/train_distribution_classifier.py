@@ -11,6 +11,7 @@ import torch.nn.functional as F
 import yaml
 
 from base.bit_sequences import (
+    ProbabilityVectorAutoencoderMLP,
     ProbabilityVectorClassifierMLP,
     SequenceClassifierMLP,
     SummarySequenceClassifierMLP,
@@ -35,6 +36,7 @@ from base.training_utils import (
 
 MODEL_TYPES = {
     "bit_sequence_mlp": SequenceClassifierMLP,
+    "probability_autoencoder_mlp": ProbabilityVectorAutoencoderMLP,
     "probability_mlp": ProbabilityVectorClassifierMLP,
     "summary_mlp": SummarySequenceClassifierMLP,
 }
@@ -61,6 +63,10 @@ def is_bit_sequence_config(config):
 
 def is_vector_label_config(config):
     return config["data"]["type"] == VECTOR_LABEL_DATA_TYPE
+
+
+def is_probability_autoencoder_config(config):
+    return config["model"]["type"] == "probability_autoencoder_mlp"
 
 
 def num_tasks(config):
@@ -96,16 +102,21 @@ def validate_config(config):
         VECTOR_LABEL_DATA_TYPE,
     )
     is_bit_sequence = data["type"] == BIT_SEQUENCE_DATA_TYPE
-    expected_model_type = {
+    allowed_model_types = {
         "dirichlet_zipf_binary": "summary_mlp",
-        PROBABILITY_VECTOR_DATA_TYPE: "probability_mlp",
+        PROBABILITY_VECTOR_DATA_TYPE: (
+            "probability_mlp",
+            "probability_autoencoder_mlp",
+        ),
         VECTOR_LABEL_DATA_TYPE: "probability_mlp",
         BIT_SEQUENCE_DATA_TYPE: "bit_sequence_mlp",
     }[data["type"]]
-    if model["type"] != expected_model_type:
+    if isinstance(allowed_model_types, str):
+        allowed_model_types = (allowed_model_types,)
+    if model["type"] not in allowed_model_types:
         raise ValueError(
             f"data.type {data['type']!r} requires model.type "
-            f"{expected_model_type!r}"
+            f"in {allowed_model_types!r}"
         )
     if not is_bit_sequence and model["vocab_size"] != data["num_states"]:
         raise ValueError("model.vocab_size must equal data.num_states")
@@ -117,7 +128,9 @@ def validate_config(config):
     label_scheme = data.get("label_scheme", "binary")
     if label_scheme not in ("binary", "identity"):
         raise ValueError("data.label_scheme must be 'binary' or 'identity'")
-    if is_vector_label_config(config):
+    if is_probability_autoencoder_config(config):
+        expected_classes = None
+    elif is_vector_label_config(config):
         d_label = data.get("d_label")
         if not isinstance(d_label, int) or isinstance(d_label, bool) or d_label < 1:
             raise ValueError("data.d_label must be a positive integer")
@@ -128,7 +141,9 @@ def validate_config(config):
         expected_classes = d_label
     else:
         expected_classes = 2 if label_scheme == "binary" else num_tasks(config)
-    if model.get("num_classes", expected_classes) != expected_classes:
+    if expected_classes is not None and (
+        model.get("num_classes", expected_classes) != expected_classes
+    ):
         if is_vector_label_config(config):
             raise ValueError(
                 "model.num_classes must match the configured label dimension"
@@ -473,6 +488,37 @@ def evaluate(
         )
         model.train()
         return
+    if is_probability_autoencoder_config(config):
+        losses = []
+        microbatch = config["evaluation"].get("microbatch_size", ids.numel())
+        for start in range(0, ids.numel(), microbatch):
+            stop = min(start + microbatch, ids.numel())
+            with autocast_context(inputs.device, amp_dtype):
+                losses.append(
+                    model(
+                        inputs[start:stop],
+                        targets=inputs[start:stop],
+                        loss_reduction="none",
+                    )["loss"]
+                )
+        losses = torch.cat(losses).cpu()
+        counts_cpu = presentation_counts[: ids.numel()].cpu()
+        rows = [
+            {
+                "iter": iteration,
+                "distribution_id": distribution_id,
+                "loss": f"{losses[distribution_id].item():.8f}",
+                "training_seen_count": int(counts_cpu[distribution_id].item()),
+            }
+            for distribution_id in range(ids.numel())
+        ]
+        append_csv_rows(
+            log_path,
+            ["iter", "distribution_id", "loss", "training_seen_count"],
+            rows,
+        )
+        model.train()
+        return
     losses = []
     microbatch = config["evaluation"].get("microbatch_size", ids.numel())
     for start in range(0, ids.numel(), microbatch):
@@ -657,16 +703,17 @@ def main():
             if config["data"].get("label_scheme", "binary") == "identity"
             else binary_labels
         )
+        targets = inputs if is_probability_autoencoder_config(config) else labels
         presentation_counts += torch.bincount(
             distribution_ids,
             minlength=num_tasks(config),
         )
         if compile_training:
-            loss = compiled_training_step(inputs, labels)
+            loss = compiled_training_step(inputs, targets)
         else:
             optimizer.zero_grad(set_to_none=True)
             with autocast_context(device, amp_dtype):
-                loss = model(inputs, targets=labels)["loss"]
+                loss = model(inputs, targets=targets)["loss"]
             grad_scaler.scale(loss).backward()
             if config["training"].get("grad_clip_norm") is not None:
                 grad_scaler.unscale_(optimizer)

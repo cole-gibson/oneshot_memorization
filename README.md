@@ -12,7 +12,8 @@ The current focus is classification under Zipf-distributed task frequencies.
   `model.type: summary_mlp` to classify sampled state sequences, or use
   `data.type: dirichlet_zipf_binary_probability_vector` with
   `model.type: probability_mlp` to classify component probability vectors
-  directly.
+  directly. Use `model.type: probability_autoencoder_mlp` with the same data
+  type to autoencode those vectors with KL-divergence reconstruction loss.
 - `data.type: dirichlet_zipf_binary_vector_probability_vector` modifies the
   probability-vector setting by assigning each distribution a fixed
   `d_label`-dimensional label in `{−1,+1}^d_label`. The model is trained with
@@ -29,6 +30,7 @@ The current focus is classification under Zipf-distributed task frequencies.
 
 Runnable examples are provided in `sample_configs/distribution_classifier.yaml`,
 `sample_configs/distribution_vector_classifier.yaml`,
+`sample_configs/distribution_vector_autoencoder.yaml`,
 `sample_configs/distribution_vector_label_regression.yaml`, and
 `sample_configs/bit_sequence_classifier.yaml`. Run one with, for example:
 

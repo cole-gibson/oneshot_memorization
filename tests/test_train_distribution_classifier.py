@@ -7,6 +7,7 @@ from unittest import mock
 import torch
 
 from base.bit_sequences import (
+    ProbabilityVectorAutoencoderMLP,
     ProbabilityVectorClassifierMLP,
     SequenceClassifierMLP,
     SummarySequenceClassifierMLP,
@@ -264,6 +265,86 @@ class ProbabilityVectorSettingTest(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "requires model.type"):
             validate_config(config)
+
+
+class ProbabilityVectorAutoencoderSettingTest(unittest.TestCase):
+    @staticmethod
+    def make_autoencoder_config():
+        config = make_config()
+        config["data"]["type"] = "dirichlet_zipf_binary_probability_vector"
+        config["data"].pop("sequence_length")
+        config["model"] = {
+            "type": "probability_autoencoder_mlp",
+            "vocab_size": 7,
+        }
+        config["evaluation"] = {"interval": 1}
+        return config
+
+    def test_config_accepts_probability_vector_autoencoder(self):
+        validate_config(self.make_autoencoder_config())
+
+    def test_model_reconstruction_loss_is_kl_divergence(self):
+        model = ProbabilityVectorAutoencoderMLP(
+            vocab_size=3,
+            embed_dim=4,
+            mlp_num_layers=0,
+        )
+        probabilities = torch.tensor([[0.2, 0.3, 0.5]])
+
+        result = model(probabilities, targets=probabilities)
+        expected = torch.nn.functional.kl_div(
+            result["probabilities"].log(),
+            probabilities,
+            reduction="batchmean",
+        )
+
+        torch.testing.assert_close(result["loss"], expected)
+        self.assertNotIn("logits", result)
+        self.assertEqual(result["probabilities"].shape, probabilities.shape)
+        torch.testing.assert_close(
+            result["probabilities"].sum(dim=-1), torch.ones(1)
+        )
+
+    def test_evaluation_logs_only_kl_loss_metric(self):
+        class FixedModel(torch.nn.Module):
+            def forward(self, inputs, targets=None, loss_reduction="mean"):
+                losses = torch.nn.functional.kl_div(
+                    inputs.log(), targets, reduction="none"
+                ).sum(dim=-1)
+                if loss_reduction != "none":
+                    losses = losses.mean()
+                return {"probabilities": inputs, "loss": losses}
+
+        model = FixedModel()
+        model.train()
+        probabilities = torch.tensor([[0.8, 0.2], [0.1, 0.9]])
+        eval_batch = {
+            "tokens": probabilities,
+            "labels": torch.tensor([1, 0]),
+            "distribution_ids": torch.tensor([0, 1]),
+        }
+
+        with tempfile.TemporaryDirectory() as directory:
+            log_path = Path(directory) / "eval.csv"
+            evaluate(
+                model=model,
+                data_generator=None,
+                config=self.make_autoencoder_config(),
+                eval_batch=eval_batch,
+                presentation_counts=torch.tensor([4, 2]),
+                log_path=log_path,
+                iteration=7,
+                amp_dtype=None,
+            )
+            with log_path.open(newline="") as file:
+                rows = list(csv.DictReader(file))
+
+        self.assertEqual(
+            list(rows[0]),
+            ["iter", "distribution_id", "loss", "training_seen_count"],
+        )
+        self.assertTrue(all(float(row["loss"]) < 1e-6 for row in rows))
+        self.assertTrue(model.training)
 
 
 class ProbabilityVectorLabelRegressionSettingTest(unittest.TestCase):

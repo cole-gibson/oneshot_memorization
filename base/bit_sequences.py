@@ -19,6 +19,15 @@ def make_mlp(input_dim, output_dim, hidden_dim, num_hidden_layers, dropout):
     return nn.Sequential(*layers)
 
 
+def probability_vector_kl_divergence(logits, targets, reduction="mean"):
+    losses = F.kl_div(
+        F.log_softmax(logits, dim=-1),
+        targets.to(dtype=logits.dtype),
+        reduction="none",
+    ).sum(dim=-1)
+    return losses if reduction == "none" else losses.mean()
+
+
 class ZipfBitSequenceGenerator:
     """Sample fixed bit sequences from a Zipf prior over sequence ranks."""
 
@@ -378,3 +387,33 @@ class ProbabilityVectorClassifierMLP(nn.Module):
             else:
                 loss = F.mse_loss(logits, targets)
         return {"logits": logits, "loss": loss}
+
+
+class ProbabilityVectorAutoencoderMLP(ProbabilityVectorClassifierMLP):
+    """Autoencode a categorical probability vector through an embedding."""
+
+    def __init__(
+        self,
+        vocab_size,
+        embed_dim=256,
+        mlp_ratio=4,
+        mlp_num_layers=2,
+        dropout=0.0,
+    ):
+        super().__init__(
+            vocab_size=vocab_size,
+            num_classes=vocab_size,
+            embed_dim=embed_dim,
+            mlp_ratio=mlp_ratio,
+            mlp_num_layers=mlp_num_layers,
+            dropout=dropout,
+        )
+
+    def forward(self, probabilities, targets=None, loss_reduction="mean"):
+        logits = super().forward(probabilities)["logits"]
+        output = {"probabilities": F.softmax(logits, dim=-1), "loss": None}
+        if targets is not None:
+            output["loss"] = probability_vector_kl_divergence(
+                logits, targets, reduction=loss_reduction
+            )
+        return output
