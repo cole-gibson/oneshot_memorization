@@ -18,6 +18,7 @@ from base.data_generator import (
 from base.train_distribution_classifier import (
     evaluate,
     logarithmic_evaluation_iterations,
+    logarithmic_iterations,
     make_compiled_training_step,
     validate_config,
 )
@@ -153,6 +154,42 @@ class EvaluationScheduleTest(unittest.TestCase):
         config["evaluation"]["spacing"] = "geometric"
 
         with self.assertRaisesRegex(ValueError, "evaluation.spacing"):
+            validate_config(config)
+
+
+class CheckpointScheduleTest(unittest.TestCase):
+    def test_logarithmic_iterations_have_configured_density(self):
+        self.assertEqual(
+            logarithmic_iterations(100, points_per_decade=2),
+            {1, 3, 10, 32, 100},
+        )
+
+    def test_logarithmic_config_does_not_require_linear_interval(self):
+        config = make_config()
+        config["training"] = {
+            "max_iters": 100,
+            "checkpoint_spacing": "logarithmic",
+            "checkpoint_points_per_decade": 4,
+        }
+
+        validate_config(config)
+
+    def test_logarithmic_density_must_be_a_positive_integer(self):
+        for value in (0, 1.5, True):
+            with self.subTest(value=value):
+                config = make_config()
+                config["training"]["checkpoint_spacing"] = "logarithmic"
+                config["training"]["checkpoint_points_per_decade"] = value
+                with self.assertRaisesRegex(
+                    ValueError, "checkpoint_points_per_decade"
+                ):
+                    validate_config(config)
+
+    def test_unknown_spacing_is_rejected(self):
+        config = make_config()
+        config["training"]["checkpoint_spacing"] = "geometric"
+
+        with self.assertRaisesRegex(ValueError, "checkpoint_spacing"):
             validate_config(config)
 
 

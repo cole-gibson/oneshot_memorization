@@ -139,8 +139,24 @@ def validate_config(config):
         )
     if training["max_iters"] < 1:
         raise ValueError("training.max_iters must be at least 1")
-    if training["checkpoint_interval"] < 1:
+    checkpoint_spacing = training.get("checkpoint_spacing", "linear")
+    if checkpoint_spacing not in ("linear", "logarithmic"):
+        raise ValueError(
+            "training.checkpoint_spacing must be 'linear' or 'logarithmic'"
+        )
+    if checkpoint_spacing == "linear" and training["checkpoint_interval"] < 1:
         raise ValueError("training.checkpoint_interval must be at least 1")
+    checkpoint_points_per_decade = training.get(
+        "checkpoint_points_per_decade", 10
+    )
+    if checkpoint_spacing == "logarithmic" and (
+        not isinstance(checkpoint_points_per_decade, int)
+        or isinstance(checkpoint_points_per_decade, bool)
+        or checkpoint_points_per_decade < 1
+    ):
+        raise ValueError(
+            "training.checkpoint_points_per_decade must be a positive integer"
+        )
     evaluation_spacing = evaluation.get("spacing", "linear")
     if evaluation_spacing not in ("linear", "logarithmic"):
         raise ValueError(
@@ -203,7 +219,7 @@ def build_model(config):
     return MODEL_TYPES[model_type](**model)
 
 
-def logarithmic_evaluation_iterations(max_iters, points_per_decade):
+def logarithmic_iterations(max_iters, points_per_decade):
     """Return integer iterations spaced uniformly on a base-10 log scale."""
     max_exponent = math.ceil(points_per_decade * math.log10(max_iters))
     iterations = {
@@ -213,6 +229,10 @@ def logarithmic_evaluation_iterations(max_iters, points_per_decade):
     iterations = {iteration for iteration in iterations if iteration <= max_iters}
     iterations.add(max_iters)
     return iterations
+
+
+def logarithmic_evaluation_iterations(max_iters, points_per_decade):
+    return logarithmic_iterations(max_iters, points_per_decade)
 
 
 def build_optimizer(model, config, device):
@@ -601,6 +621,12 @@ def main():
             max_iters,
             config["evaluation"].get("points_per_decade", 10),
         )
+    logarithmic_checkpoint_iterations = None
+    if config["training"].get("checkpoint_spacing", "linear") == "logarithmic":
+        logarithmic_checkpoint_iterations = logarithmic_iterations(
+            max_iters,
+            config["training"].get("checkpoint_points_per_decade", 10),
+        )
     model.train()
     for iteration in range(start_iter + 1, max_iters + 1):
         batch_size = config["data"]["batch_size"]
@@ -661,10 +687,13 @@ def main():
             or iteration % log_interval == 0
             or iteration == max_iters
         )
-        should_checkpoint = (
-            iteration % config["training"]["checkpoint_interval"] == 0
-            or iteration == max_iters
-        )
+        if logarithmic_checkpoint_iterations is None:
+            should_checkpoint = (
+                iteration % config["training"]["checkpoint_interval"] == 0
+                or iteration == max_iters
+            )
+        else:
+            should_checkpoint = iteration in logarithmic_checkpoint_iterations
         loss_value = None
         if should_log_train or should_report or should_checkpoint:
             loss_value = loss.item()

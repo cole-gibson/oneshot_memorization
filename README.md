@@ -50,3 +50,10 @@ Evaluation uses a linear stride by default (`evaluation.spacing: linear` and
 `evaluation.spacing: logarithmic` and `evaluation.points_per_decade` to the
 desired number of evaluations per factor of ten in training iterations. The
 logarithmic schedule always includes iterations 1 and `training.max_iters`.
+
+Checkpoint recording also uses a linear stride by default
+(`training.checkpoint_spacing: linear` and `training.checkpoint_interval`). To
+record checkpoints logarithmically, set `training.checkpoint_spacing` to
+`logarithmic` and `training.checkpoint_points_per_decade` to the desired number
+of checkpoints per factor of ten in training iterations. The logarithmic
+schedule always includes iterations 1 and `training.max_iters`.
