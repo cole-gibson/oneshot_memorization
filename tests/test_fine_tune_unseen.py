@@ -1,7 +1,9 @@
 import csv
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 
@@ -13,6 +15,7 @@ from base.fine_tune_unseen import (
     threshold_reached,
 )
 from base.train_distribution_classifier import build_model
+from utils.submit_fine_tune_slurm_array import find_training_runs, write_sbatch
 
 
 class FineTuneHelpersTest(unittest.TestCase):
@@ -64,6 +67,54 @@ class FineTuneHelpersTest(unittest.TestCase):
             paths = checkpoint_paths(run_dir)
 
         self.assertEqual([iteration for iteration, _ in paths], [10, 20])
+
+
+class FineTuneSubmissionTest(unittest.TestCase):
+    def test_discovers_only_training_runs_with_numbered_checkpoints(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            valid_run = root / "runs" / "valid"
+            (valid_run / "checkpoints").mkdir(parents=True)
+            (valid_run / "config.yaml").touch()
+            (valid_run / "checkpoints" / "checkpoint_000001.pt").touch()
+            invalid_run = root / "runs" / "latest_only"
+            (invalid_run / "checkpoints").mkdir(parents=True)
+            (invalid_run / "config.yaml").touch()
+            (invalid_run / "checkpoints" / "latest.pt").touch()
+
+            runs = find_training_runs(root)
+
+        self.assertEqual(runs, [valid_run.resolve()])
+
+    def test_generated_sbatch_is_valid_shell_and_invokes_runner(self):
+        args = SimpleNamespace(
+            venv=Path(".venv"),
+            partition=None,
+            account=None,
+            qos=None,
+            time="00:10:00",
+            mem="1G",
+            cpus_per_task=1,
+            gpus=None,
+            gres="gpu:1",
+            constraint=None,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sbatch_path = root / "submit.sbatch"
+            write_sbatch(
+                sbatch_path,
+                args,
+                root / "manifest.tsv",
+                root / "config.yaml",
+                root / "logs",
+                3,
+            )
+            contents = sbatch_path.read_text()
+            subprocess.run(["bash", "-n", str(sbatch_path)], check=True)
+
+        self.assertIn("#SBATCH --array=0-2", contents)
+        self.assertIn("-m base.fine_tune_unseen", contents)
 
 
 class FineTuneIntegrationTest(unittest.TestCase):
